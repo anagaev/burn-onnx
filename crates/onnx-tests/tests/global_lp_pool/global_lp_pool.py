@@ -1,0 +1,75 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# dependencies = [
+#   "numpy==2.2.4",
+#   "onnx==1.19.0",
+#   "onnxruntime",
+# ]
+# ///
+
+
+import numpy as np
+import onnx
+import onnx.helper as helper
+from onnx import TensorProto
+import onnxruntime as ort
+from onnx.reference import ReferenceEvaluator
+import onnxruntime as ort
+
+def build_model(p, suffix, input_shape=(2, 3, 4)):
+    np.random.seed(42)
+
+    attrs = {}
+    if p is not None:
+        attrs["p"] = p
+
+    node = helper.make_node(
+        "GlobalLpPool",
+        inputs=["input"],
+        outputs=["output"],
+        **attrs,
+    )
+
+    input_info = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, list(input_shape)
+    )
+    output_shape = [1] * len(input_shape)
+    for i in range(0, 2):
+        output_shape[i] = input_shape[i]
+
+    output_info = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, list(output_shape)
+    )
+
+    graph = helper.make_graph(
+        [node], "global_lp_pooling_graph", [input_info], [output_info]
+    )
+    # Operator id 22 is not supported yet.
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 7)])
+    model.ir_version = 8
+
+    onnx.checker.check_model(model)
+
+    file_name = f"global_lp_pool_{suffix}.onnx"
+    onnx.save(model, file_name)
+    print(f"Finished exporting model to {file_name}")
+
+    test_input = np.random.randn(*input_shape).astype(np.float32)
+    session = ort.InferenceSession(file_name, providers=["CPUExecutionProvider"])
+    output = session.run(None, {"input": test_input})[0]
+
+    print(f"Test input shape: {test_input.shape}")
+    print("Test input:")
+    print(np.array2string(test_input, precision=8, max_line_width=120))
+    print(f"Test output shape: {output.shape}")
+    print("Test output:")
+    print(np.array2string(output, precision=8, max_line_width=120))
+
+
+if __name__ == "__main__":
+    build_model(p=None, suffix="default")
+    build_model(p=1, suffix="l1")
+    build_model(p=2, suffix="l2")
+    build_model(p=3, suffix="l3")
+    build_model(p=3, suffix="rank_4_l3", input_shape=(2, 3, 2, 3))

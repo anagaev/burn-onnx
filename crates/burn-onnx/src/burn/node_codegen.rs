@@ -171,6 +171,7 @@ impl_node_codegen_dispatch! {
     MaxPool2d,
     MaxPool3d,
     GlobalAveragePool,
+    GlobalLpPool,
 
     // Normalization ops
     BatchNormalization,
