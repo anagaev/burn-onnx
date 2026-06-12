@@ -34,18 +34,14 @@ impl NodeCodegen for onnx_ir::global_lp_pool::GlobalLpPoolNode {
         let mut body = quote! {let x = #input.abs();};
         match p {
             1 => {
-                body.extend(
-                    quote! {x.sum_dims(&[#(#dims),*])}
-                );
-            },
+                body.extend(quote! {x.sum_dims(&[#(#dims),*])});
+            }
             2 => {
-                body.extend(
-                    quote! {x.square().sum_dims(&[#(#dims),*]).sqrt()}
-                );
-            },
+                body.extend(quote! {x.square().sum_dims(&[#(#dims),*]).sqrt()});
+            }
             _ => {
                 body.extend(
-                    quote! {x.powi_scalar(#p).sum_dims(&[#(#dims),*]).powf_scalar(#inv_p) }
+                    quote! {x.powi_scalar(#p).sum_dims(&[#(#dims),*]).powf_scalar(#inv_p) },
                 );
             }
         }
@@ -54,7 +50,6 @@ impl NodeCodegen for onnx_ir::global_lp_pool::GlobalLpPoolNode {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

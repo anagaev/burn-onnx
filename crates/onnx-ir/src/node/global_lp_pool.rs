@@ -5,7 +5,7 @@
 //! **ONNX Spec**: <https://onnx.ai/onnx/operators/onnx__GlobalLpPool.html>
 //!
 //! ## Type Constraints
-//! - T: tensor(double), tensor(float), tensor(float16) 
+//! - T: tensor(double), tensor(float), tensor(float16)
 //!
 //! ## Opset Versions
 //! - **Opset 1**: Initial version (types: float16, float, double)
@@ -70,9 +70,10 @@ impl NodeProcessor for GlobalLpPoolProcessor {
         };
 
         if !matches!(tensor_ty.dtype, DType::F16 | DType::F32 | DType::F64) {
-            return Err(ProcessError::TypeMismatch { 
-                expected: "DType::F16 | DType::F32 | DType::F64".to_string(), 
-                actual: format!("{:?}", tensor_ty.dtype) })
+            return Err(ProcessError::TypeMismatch {
+                expected: "DType::F16 | DType::F32 | DType::F64".to_string(),
+                actual: format!("{:?}", tensor_ty.dtype),
+            });
         }
 
         let static_shape = {
@@ -80,8 +81,9 @@ impl NodeProcessor for GlobalLpPoolProcessor {
                 .static_shape
                 .clone()
                 .unwrap_or_else(|| vec![None; tensor_ty.rank]);
-            for i in 2..tensor_ty.rank {
-                shape[i] = Some(1);
+
+            for el in shape.iter_mut().skip(2) {
+                *el = Some(1usize);
             }
             Some(shape)
         };
@@ -91,7 +93,7 @@ impl NodeProcessor for GlobalLpPoolProcessor {
         node.outputs[0].ty = ArgType::Tensor(TensorType {
             dtype: tensor_ty.dtype,
             rank: tensor_ty.rank,
-            static_shape
+            static_shape,
         });
 
         Ok(())
@@ -114,7 +116,6 @@ impl NodeProcessor for GlobalLpPoolProcessor {
             config,
         })
     }
-
 }
 
 fn extract_p(node: &RawNode) -> Result<i64, ProcessError> {
@@ -129,10 +130,9 @@ fn extract_p(node: &RawNode) -> Result<i64, ProcessError> {
             "GlobalLpPool: p must be > 0, got {}",
             p
         )));
-    }
+    };
     Ok(p)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -142,14 +142,13 @@ mod tests {
 
     #[test]
     fn test_global_lp_pool_missing_input() {
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .output_tensor_f32("output", 3, None);
         builder = builder.attr_int("p", 2);
         let node = builder.build();
         let processor = GlobalLpPoolProcessor;
         let spec = processor.spec();
         let result = crate::processor::validate_node_spec(&node, 16, &spec);
-        println!("{:?}", result);
         assert!(matches!(
             result,
             Err(ProcessError::InvalidInputCount { .. })
@@ -158,14 +157,13 @@ mod tests {
 
     #[test]
     fn test_global_lp_pool_missing_outputs() {
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .input_tensor_f32("input", 3, None);
         builder = builder.attr_int("p", 2);
         let node = builder.build();
         let processor = GlobalLpPoolProcessor;
         let spec = processor.spec();
         let result = crate::processor::validate_node_spec(&node, 16, &spec);
-        println!("{:?}", result);
         assert!(matches!(
             result,
             Err(ProcessError::InvalidOutputCount { .. })
@@ -175,7 +173,7 @@ mod tests {
     #[test]
     fn test_global_lp_pool_invalid_inputs() {
         let rank = 3;
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .input_tensor_f32("input1", rank, None) // NCD1D2... format
             .input_tensor_f32("input2", rank, None) // NCD1D2... format
             .output_tensor_f32("output", rank, None);
@@ -184,7 +182,6 @@ mod tests {
         let processor = GlobalLpPoolProcessor;
         let spec = processor.spec();
         let result = crate::processor::validate_node_spec(&node, 16, &spec);
-        println!("{:?}", result);
         assert!(matches!(
             result,
             Err(ProcessError::InvalidInputCount { .. })
@@ -194,7 +191,7 @@ mod tests {
     #[test]
     fn test_global_lp_pool_invalid_outputs() {
         let rank = 3;
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .input_tensor_f32("input", rank, None) // NCD1D2... format
             .output_tensor_f32("output1", rank, None)
             .output_tensor_f32("output2", rank, None);
@@ -203,7 +200,6 @@ mod tests {
         let processor = GlobalLpPoolProcessor;
         let spec = processor.spec();
         let result = crate::processor::validate_node_spec(&node, 16, &spec);
-        println!("{:?}", result);
         assert!(matches!(
             result,
             Err(ProcessError::InvalidOutputCount { .. })
@@ -213,7 +209,7 @@ mod tests {
     #[test]
     fn test_global_lp_pool_scalar_input() {
         let rank = 3;
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .input_scalar_f32("input")
             .output_tensor_f32("output", rank, None);
         builder = builder.attr_int("p", 2);
@@ -221,16 +217,16 @@ mod tests {
         let processor = GlobalLpPoolProcessor;
         let prefs = OutputPreferences::new();
         let result = processor.infer_types(&mut node, 16, &prefs);
-        println!("{:?}", result);
-        assert!(matches!(
-            result,
-            Err(ProcessError::TypeMismatch { .. })
-        ));
-    } 
-    
-    fn create_test_node(p: Option<i64>, rank: usize, statis_shape: Option<Vec<usize>>) -> TestNodeBuilder {
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
-            .input_tensor_f32("input", rank, statis_shape) // NCD1D2... format
+        assert!(matches!(result, Err(ProcessError::TypeMismatch { .. })));
+    }
+
+    fn create_test_node(
+        p: Option<i64>,
+        rank: usize,
+        static_shape: Option<Vec<usize>>,
+    ) -> TestNodeBuilder {
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+            .input_tensor_f32("input", rank, static_shape) // NCD1D2... format
             .output_tensor_f32("output", rank, None);
         if let Some(p) = p {
             builder = builder.attr_int("p", p);
@@ -259,23 +255,28 @@ mod tests {
     fn test_global_lp_pool_extract_config_p_negative() {
         let node = create_test_node(Some(-4), 4, None).build();
         let processor = GlobalLpPoolProcessor;
-        assert!(matches!(processor.extract_config(&node, 16), Err(ProcessError::Custom(_)))); 
+        assert!(matches!(
+            processor.extract_config(&node, 16),
+            Err(ProcessError::Custom(_))
+        ));
     }
-    
+
     #[test]
-    fn test_global_lp_pool_unvalid_input_rank() {
+    fn test_global_lp_pool_invalid_input_rank() {
         let rank = 2;
         let mut node = create_test_node(None, rank, None).build();
         let processor = GlobalLpPoolProcessor;
         let prefs = OutputPreferences::new();
-        assert!(matches!(processor.infer_types(&mut node, 16, &prefs), Err(ProcessError::Custom(_)))); 
-        
+        assert!(matches!(
+            processor.infer_types(&mut node, 16, &prefs),
+            Err(ProcessError::Custom(_))
+        ));
     }
 
     #[test]
     fn test_global_lp_pool_no_float_input_dtype() {
         let rank = 3;
-        let mut builder =  TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
             .input_tensor_i32("input", rank, None)
             .output_tensor_i32("output", rank, None);
         builder = builder.attr_int("p", 2);
@@ -283,17 +284,14 @@ mod tests {
         let processor = GlobalLpPoolProcessor;
         let prefs = OutputPreferences::new();
         let result = processor.infer_types(&mut node, 16, &prefs);
-        assert!(matches!(
-            result,
-            Err(ProcessError::TypeMismatch { .. })
-        ));
+        assert!(matches!(result, Err(ProcessError::TypeMismatch { .. })));
     }
 
     #[test]
     fn test_global_lp_pool_no_static_shape_rank_3() {
         let rank = 3;
-        let mut output_static_shape_for_test = vec!(None; rank);
-        for i in 2..rank{
+        let mut output_static_shape_for_test = vec![None; rank];
+        for i in 2..rank {
             output_static_shape_for_test[i] = Some(1);
         }
         let mut node = create_test_node(None, rank, None).build();
@@ -303,18 +301,20 @@ mod tests {
         if let ArgType::Tensor(output_tensor) = &node.outputs[0].ty {
             assert_eq!(output_tensor.dtype, DType::F32);
             assert_eq!(output_tensor.rank, rank);
-            assert_eq!(output_tensor.static_shape, Some(output_static_shape_for_test));
+            assert_eq!(
+                output_tensor.static_shape,
+                Some(output_static_shape_for_test)
+            );
         } else {
             panic!("Expected Tensor output");
         }
-        
     }
 
     #[test]
     fn test_global_lp_pool_no_static_shape_rank_5() {
         let rank = 5;
-        let mut output_static_shape_for_test = vec!(None; rank);
-        for i in 2..rank{
+        let mut output_static_shape_for_test = vec![None; rank];
+        for i in 2..rank {
             output_static_shape_for_test[i] = Some(1);
         }
         let mut node = create_test_node(None, rank, None).build();
@@ -324,19 +324,21 @@ mod tests {
         if let ArgType::Tensor(output_tensor) = &node.outputs[0].ty {
             assert_eq!(output_tensor.dtype, DType::F32);
             assert_eq!(output_tensor.rank, rank);
-            assert_eq!(output_tensor.static_shape, Some(output_static_shape_for_test));
+            assert_eq!(
+                output_tensor.static_shape,
+                Some(output_static_shape_for_test)
+            );
         } else {
             panic!("Expected Tensor output");
         }
-        
     }
 
     #[test]
     fn test_global_lp_pool_static_shape_rank_3() {
-        let static_shape = vec!(2, 4, 32);
+        let static_shape = vec![2, 4, 32];
         let rank = static_shape.len();
-        let mut output_static_shape_for_test = vec!(None; rank);
-        for i in 0..rank{
+        let mut output_static_shape_for_test = vec![None; rank];
+        for i in 0..rank {
             if i < 2 {
                 output_static_shape_for_test[i] = Some(static_shape[i]);
             } else {
@@ -350,7 +352,10 @@ mod tests {
         if let ArgType::Tensor(output_tensor) = &node.outputs[0].ty {
             assert_eq!(output_tensor.dtype, DType::F32);
             assert_eq!(output_tensor.rank, rank);
-            assert_eq!(output_tensor.static_shape, Some(output_static_shape_for_test));
+            assert_eq!(
+                output_tensor.static_shape,
+                Some(output_static_shape_for_test)
+            );
         } else {
             panic!("Expected Tensor output");
         }
@@ -358,10 +363,10 @@ mod tests {
 
     #[test]
     fn test_global_lp_pool_static_shape_rank_5() {
-        let static_shape = vec!(2, 4, 32, 32, 32);
+        let static_shape = vec![2, 4, 32, 32, 32];
         let rank = static_shape.len();
-        let mut output_static_shape_for_test = vec!(None; rank);
-        for i in 0..rank{
+        let mut output_static_shape_for_test = vec![None; rank];
+        for i in 0..rank {
             if i < 2 {
                 output_static_shape_for_test[i] = Some(static_shape[i]);
             } else {
@@ -375,10 +380,12 @@ mod tests {
         if let ArgType::Tensor(output_tensor) = &node.outputs[0].ty {
             assert_eq!(output_tensor.dtype, DType::F32);
             assert_eq!(output_tensor.rank, rank);
-            assert_eq!(output_tensor.static_shape, Some(output_static_shape_for_test));
+            assert_eq!(
+                output_tensor.static_shape,
+                Some(output_static_shape_for_test)
+            );
         } else {
             panic!("Expected Tensor output");
         }
     }
-
 }
