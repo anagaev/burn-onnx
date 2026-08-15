@@ -28,7 +28,7 @@ on:
       - '!LICENSE-MIT'
 
 env:
-  RUST_PREVIOUS_VERSION: 1.92.0
+  RUST_PREVIOUS_VERSION: 1.95.0
   # Test in release mode (make it an empty string to test in debug mode)
   TEST_RELEASE_FLAG: "--release"
   # Crates excluded from CI builds/tests:
@@ -67,7 +67,7 @@ jobs:
             toolchain: stable
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v9
@@ -104,7 +104,7 @@ jobs:
             toolchain: stable
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v9
@@ -137,7 +137,7 @@ jobs:
             toolchain: ${{ needs.prepare-checks.outputs.rust-prev-version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v9
@@ -163,7 +163,7 @@ jobs:
             toolchain: ${{ needs.prepare-checks.outputs.rust-prev-version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v9
@@ -190,7 +190,7 @@ jobs:
             toolchain: stable
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
         uses: tracel-ai/github-actions/install-rust@v9
@@ -229,7 +229,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # --------------------------------------------------------------------------------
