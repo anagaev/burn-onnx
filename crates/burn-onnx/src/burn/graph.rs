@@ -89,7 +89,7 @@ impl BurnGraph {
         let tensors = snapshots
             .iter()
             .map(|snapshot| {
-                let data = snapshot.to_data()?;
+                let data = snapshot.to_data().map_err(|e| (snapshot.full_path(), e))?;
                 Ok(Tensor::new(
                     snapshot.full_path(),
                     snapshot.dtype,
@@ -98,15 +98,22 @@ impl BurnGraph {
                     data.bytes,
                 ))
             })
-            .collect::<Result<Vec<_>, burn_store::TensorSnapshotError>>()
-            .expect("Failed to materialize tensor snapshots");
+            .collect::<Result<Vec<_>, (String, burn_store::TensorSnapshotError)>>()
+            .unwrap_or_else(|(path, e)| {
+                panic!("Failed to materialize tensor snapshot {path}: {e}")
+            });
 
         // Write burnpack file
         let burnpack_file = out_file.with_extension("bpk");
         Writer::new(tensors)
             .with_metadata("producer", "burn-onnx")
             .write_to_file(&burnpack_file)
-            .expect("Failed to write burnpack file");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to write burnpack file {}: {e}",
+                    burnpack_file.display()
+                )
+            });
 
         // Register the loading code based on strategy
         if strategy != LoadStrategy::None {
@@ -629,7 +636,7 @@ impl BurnGraph {
 
         match strategy {
             LoadStrategy::File => {
-                let file = file.to_str().unwrap();
+                let file = path_to_str(&file);
                 statics = quote! {
                     // `from_file` requires `std::path::Path`; opt into std so this
                     // also works when included from `#![no_std]` crates.
@@ -648,8 +655,14 @@ impl BurnGraph {
                     /// Load model weights from a burnpack file.
                     pub fn from_file<P: AsRef<std::path::Path>>(file: P, device: &Device) -> Self {
                         let mut model = Self::new(device);
-                        let mut store = BurnpackStore::from_file(file);
-                        model.load_from(&mut store).expect("Failed to load burnpack file");
+                        let mut store = BurnpackStore::from_file(&file);
+                        model.load_from(&mut store)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Failed to load burnpack file {}: {e}",
+                                    file.as_ref().display()
+                                )
+                            });
                         model
                     }
                     _blank_!();
@@ -657,9 +670,14 @@ impl BurnGraph {
             }
             LoadStrategy::Embedded => {
                 let file_size = std::fs::metadata(&file)
-                    .expect("Failed to read burnpack file metadata")
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Failed to read burnpack file metadata {}: {e}",
+                            file.display()
+                        )
+                    })
                     .len() as usize;
-                let file = file.to_str().unwrap();
+                let file = path_to_str(&file);
                 statics = quote! {
                     // Align embedded data to 256-byte boundary to match burnpack's internal alignment.
                     // This ensures tensor data remains properly aligned for zero-copy loading,
@@ -691,7 +709,13 @@ impl BurnGraph {
                     pub fn from_embedded(device: &Device) -> Self {
                         let mut model = Self::new(device);
                         let mut store = BurnpackStore::from_static(EMBEDDED_STATES);
-                        model.load_from(&mut store).expect("Failed to load embedded burnpack");
+                        model.load_from(&mut store)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Failed to load embedded burnpack (built from {}): {e}",
+                                    #file
+                                )
+                            });
                         model
                     }
                     _blank_!();
@@ -712,7 +736,8 @@ impl BurnGraph {
                 pub fn from_bytes(bytes: Bytes, device: &Device) -> Self {
                     let mut model = Self::new(device);
                     let mut store = BurnpackStore::from_bytes(Some(bytes));
-                    model.load_from(&mut store).expect("Failed to load burnpack bytes");
+                    model.load_from(&mut store)
+                        .unwrap_or_else(|e| panic!("Failed to load burnpack bytes: {e}"));
                     model
                 }
             }
@@ -968,6 +993,19 @@ impl BurnGraph {
 // ============================================================================
 
 type FieldTuple = (proc_macro2::Ident, TokenStream, Option<TokenStream>);
+
+/// Render a burnpack path as `&str` for embedding into generated source.
+///
+/// The path is baked into the generated code as a string literal (`from_file(#file)`,
+/// `include_bytes!(#file)`), so a non-UTF-8 path cannot be represented at all.
+fn path_to_str(path: &std::path::Path) -> &str {
+    path.to_str().unwrap_or_else(|| {
+        panic!(
+            "Burnpack path is not valid UTF-8 and cannot be embedded in generated code: {}",
+            path.display()
+        )
+    })
+}
 
 /// Collect fields from a slice of nodes (including If/Loop subgraph fields).
 fn collect_fields_for_nodes(nodes: &[Node], hooks: &HookRegistry) -> Vec<FieldTuple> {
@@ -1500,7 +1538,7 @@ mod tests {
             };
             let out_name = format!("t{}", i);
 
-            let node = AbsNodeBuilder::new(&format!("abs{}", i))
+            let node = AbsNodeBuilder::new(format!("abs{}", i))
                 .input_tensor(&in_name, 2, DType::F32)
                 .output_tensor(&out_name, 2, DType::F32)
                 .build();
@@ -1751,6 +1789,10 @@ mod tests {
         assert!(code.contains("impl Default for Model"));
         assert!(code.contains("Self::from_file("));
         assert!(!code.contains("from_embedded"));
+        // A load failure must name the offending file and the underlying error;
+        // "Failed to load burnpack file" alone sends users hunting for the wrong path.
+        assert!(code.contains("Failed to load burnpack file {}: {e}"));
+        assert!(code.contains("Failed to load burnpack bytes: {e}"));
         // `from_file` references `std::path::Path`, which is not resolvable from
         // `#![no_std]` consumers unless std is explicitly linked. Pin the opt-in.
         assert!(code.contains("extern crate std;"));
@@ -1770,6 +1812,8 @@ mod tests {
         assert!(code.contains("include_bytes!"));
         assert!(!code.contains("from_file"));
         assert!(!code.contains("extern crate std"));
+        // Embedded data has no runtime path, so report the build-time source instead.
+        assert!(code.contains("Failed to load embedded burnpack (built from {}): {e}"));
     }
 
     #[test]
