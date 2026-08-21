@@ -19,6 +19,10 @@
 //!   the same length.
 
 use super::prelude::*;
+use super::rnn_common::{
+    self, BiasLayout, GateLayout, ModuleExpr, state_direction_axis, weights_are_runtime,
+    y_direction_axis,
+};
 use burn::nn::activation::ActivationConfig;
 use burn_store::TensorSnapshot;
 use onnx_ir::lstm::{LstmActivationFunction, LstmDirection};
@@ -83,20 +87,31 @@ fn collect_lstm_snapshots(
     let data_r = extract_node_data(inputs, 2);
     let data_b = extract_node_data(inputs, 3);
 
-    let Some(data_w) = data_w else {
-        return vec![];
+    // `field()` emitted a module, so every weight was supposed to resolve.
+    // `validate_uniform_group` in onnx-ir rejects the model-shaped ways this can fail (a
+    // missing W/R, or a group split across initializers and graph inputs), so reaching
+    // here means the tensor store lost a value we were promised. Returning an empty list
+    // instead would rebuild the bug this path exists to fix: a struct full of gate
+    // `Param`s that no snapshot fills, which `from_file` reports as missing tensors and
+    // `Model::new` silently fills with random values.
+    let (Some(data_w), Some(data_r)) = (data_w, data_r) else {
+        panic!(
+            "LSTM '{field_name}': W/R are build-time weights but their data did not resolve. \
+             The generated model would load with uninitialized gate weights."
+        );
     };
-    let Some(data_r) = data_r else {
-        return vec![];
-    };
+    assert_eq!(
+        data_b.is_some(),
+        config.has_bias,
+        "LSTM '{field_name}': config says has_bias={} but B data resolved to {}",
+        config.has_bias,
+        data_b.is_some()
+    );
 
     let dtype = data_w.dtype;
     let device = Default::default();
 
-    // ONNX gate order: i(input), o(output), f(forget), c(cell)
-    // Burn gate order: input_gate, forget_gate, output_gate, cell_gate
-    let onnx_to_burn_gate_order = [0usize, 2, 1, 3]; // input, forget, output, cell
-    let gate_names = ["input_gate", "forget_gate", "output_gate", "cell_gate"];
+    let gate_count = GATE_LAYOUT.count();
 
     // Determine direction prefixes based on LSTM type
     let direction_prefixes: Vec<&str> = match config.direction {
@@ -120,27 +135,34 @@ fn collect_lstm_snapshots(
 
     for (dir_idx, dir_prefix) in direction_prefixes.iter().enumerate() {
         // Select direction slice from W and R
-        // W shape: [num_directions, 4*hidden_size, input_size]
+        // W shape: [num_directions, gates*hidden_size, input_size]
         let w_dir = w_tensor
             .clone()
-            .slice([dir_idx..dir_idx + 1, 0..4 * hidden_size, 0..input_size])
-            .squeeze::<2>(); // [4*hidden_size, input_size]
+            .slice([
+                dir_idx..dir_idx + 1,
+                0..gate_count * hidden_size,
+                0..input_size,
+            ])
+            .squeeze::<2>(); // [gates*hidden_size, input_size]
 
-        // R shape: [num_directions, 4*hidden_size, hidden_size]
+        // R shape: [num_directions, gates*hidden_size, hidden_size]
         let r_dir = r_tensor
             .clone()
-            .slice([dir_idx..dir_idx + 1, 0..4 * hidden_size, 0..hidden_size])
-            .squeeze::<2>(); // [4*hidden_size, hidden_size]
+            .slice([
+                dir_idx..dir_idx + 1,
+                0..gate_count * hidden_size,
+                0..hidden_size,
+            ])
+            .squeeze::<2>(); // [gates*hidden_size, hidden_size]
 
-        // B shape: [num_directions, 8*hidden_size]
+        // B shape: [num_directions, 2*gates*hidden_size]
         let b_dir = b_tensor.as_ref().map(|b| {
             b.clone()
-                .slice([dir_idx..dir_idx + 1, 0..8 * hidden_size])
-                .squeeze::<1>() // [8*hidden_size]
+                .slice([dir_idx..dir_idx + 1, 0..2 * gate_count * hidden_size])
+                .squeeze::<1>() // [2*gates*hidden_size]
         });
 
-        for (gate_idx, gate_name) in gate_names.iter().enumerate() {
-            let onnx_gate_idx = onnx_to_burn_gate_order[gate_idx];
+        for (gate_name, onnx_gate_idx) in GATE_LAYOUT.gates().iter().copied() {
             let start = onnx_gate_idx * hidden_size;
             let end = start + hidden_size;
 
@@ -164,7 +186,7 @@ fn collect_lstm_snapshots(
             if let Some(ref b) = b_dir {
                 let wb_start = onnx_gate_idx * hidden_size;
                 let wb_end = wb_start + hidden_size;
-                let rb_start = 4 * hidden_size + onnx_gate_idx * hidden_size;
+                let rb_start = (gate_count + onnx_gate_idx) * hidden_size;
                 let rb_end = rb_start + hidden_size;
 
                 let wb: Tensor<1> = b.clone().slice([wb_start..wb_end]);
@@ -274,6 +296,98 @@ fn activation_to_tokens(activation: &ActivationConfig) -> TokenStream {
     }
 }
 
+/// ONNX LSTM packs its gates as [i, o, f, c]; Burn declares them [i, f, o, c].
+const GATE_LAYOUT: GateLayout = GateLayout::new(
+    &[
+        ("input_gate", 0),
+        ("forget_gate", 2),
+        ("output_gate", 1),
+        ("cell_gate", 3),
+    ],
+    BiasLayout::Merged,
+);
+
+/// The module's type, and the expression that builds it on `device`.
+///
+/// `device` is the only thing that differs between the two paths: `device` names the
+/// parameter of the generated `new()`, `&self.device` the field read inside `forward()`.
+fn module_parts(node: &onnx_ir::lstm::LstmNode, device: TokenStream) -> (TokenStream, TokenStream) {
+    let d_input = node.config.input_size.to_tokens();
+    let d_hidden = node.config.hidden_size.to_tokens();
+    let bias = node.config.has_bias;
+    let batch_first = node.config.batch_first;
+    let input_forget = node.config.input_forget;
+
+    // Convert activations to tokens
+    let gate_act = to_burn_activation(node.config.gate_activation);
+    let cell_act = to_burn_activation(node.config.cell_activation);
+    let hidden_act = to_burn_activation(node.config.hidden_activation);
+
+    let gate_activation = activation_to_tokens(&gate_act);
+    let cell_activation = activation_to_tokens(&cell_act);
+    let hidden_activation = activation_to_tokens(&hidden_act);
+
+    // Generate clip config if present
+    let clip_config = if let Some(clip) = node.config.clip {
+        let clip_val = clip as f64;
+        quote! { .with_clip(Some(#clip_val)) }
+    } else {
+        quote! {}
+    };
+
+    // Only add non-default activations to config
+    let activations_config = {
+        let mut tokens = quote! {};
+        if !matches!(gate_act, ActivationConfig::Sigmoid) {
+            tokens = quote! { #tokens .with_gate_activation(#gate_activation) };
+        }
+        if !matches!(cell_act, ActivationConfig::Tanh) {
+            tokens = quote! { #tokens .with_cell_activation(#cell_activation) };
+        }
+        if !matches!(hidden_act, ActivationConfig::Tanh) {
+            tokens = quote! { #tokens .with_hidden_activation(#hidden_activation) };
+        }
+        tokens
+    };
+
+    match node.config.direction {
+        LstmDirection::Forward => (
+            quote! { Lstm },
+            quote! {
+                LstmConfig::new(#d_input, #d_hidden, #bias)
+                    .with_batch_first(#batch_first)
+                    .with_input_forget(#input_forget)
+                    #clip_config
+                    #activations_config
+                    .init(#device)
+            },
+        ),
+        LstmDirection::Reverse => (
+            quote! { Lstm },
+            quote! {
+                LstmConfig::new(#d_input, #d_hidden, #bias)
+                    .with_batch_first(#batch_first)
+                    .with_reverse(true)
+                    .with_input_forget(#input_forget)
+                    #clip_config
+                    #activations_config
+                    .init(#device)
+            },
+        ),
+        LstmDirection::Bidirectional => (
+            quote! { BiLstm },
+            quote! {
+                BiLstmConfig::new(#d_input, #d_hidden, #bias)
+                    .with_batch_first(#batch_first)
+                    .with_input_forget(#input_forget)
+                    #clip_config
+                    #activations_config
+                    .init(#device)
+            },
+        ),
+    }
+}
+
 impl NodeCodegen for onnx_ir::lstm::LstmNode {
     fn inputs(&self) -> &[Argument] {
         &self.inputs
@@ -284,84 +398,8 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
     }
 
     fn field(&self) -> Option<Field> {
-        let name = Ident::new(&self.name, Span::call_site());
-        let d_input = self.config.input_size.to_tokens();
-        let d_hidden = self.config.hidden_size.to_tokens();
-        let bias = self.config.has_bias;
-        let batch_first = self.config.batch_first;
-        let input_forget = self.config.input_forget;
-
-        // Convert activations to tokens
-        let gate_act = to_burn_activation(self.config.gate_activation);
-        let cell_act = to_burn_activation(self.config.cell_activation);
-        let hidden_act = to_burn_activation(self.config.hidden_activation);
-
-        let gate_activation = activation_to_tokens(&gate_act);
-        let cell_activation = activation_to_tokens(&cell_act);
-        let hidden_activation = activation_to_tokens(&hidden_act);
-
-        // Generate clip config if present
-        let clip_config = if let Some(clip) = self.config.clip {
-            let clip_val = clip as f64;
-            quote! { .with_clip(Some(#clip_val)) }
-        } else {
-            quote! {}
-        };
-
-        // Only add non-default activations to config
-        let activations_config = {
-            let mut tokens = quote! {};
-            if !matches!(gate_act, ActivationConfig::Sigmoid) {
-                tokens = quote! { #tokens .with_gate_activation(#gate_activation) };
-            }
-            if !matches!(cell_act, ActivationConfig::Tanh) {
-                tokens = quote! { #tokens .with_cell_activation(#cell_activation) };
-            }
-            if !matches!(hidden_act, ActivationConfig::Tanh) {
-                tokens = quote! { #tokens .with_hidden_activation(#hidden_activation) };
-            }
-            tokens
-        };
-
-        match self.config.direction {
-            LstmDirection::Forward => Some(Field::new(
-                self.name.clone(),
-                quote! { Lstm },
-                quote! {
-                    let #name = LstmConfig::new(#d_input, #d_hidden, #bias)
-                        .with_batch_first(#batch_first)
-                        .with_input_forget(#input_forget)
-                        #clip_config
-                        #activations_config
-                        .init(device);
-                },
-            )),
-            LstmDirection::Reverse => Some(Field::new(
-                self.name.clone(),
-                quote! { Lstm },
-                quote! {
-                    let #name = LstmConfig::new(#d_input, #d_hidden, #bias)
-                        .with_batch_first(#batch_first)
-                        .with_reverse(true)
-                        .with_input_forget(#input_forget)
-                        #clip_config
-                        #activations_config
-                        .init(device);
-                },
-            )),
-            LstmDirection::Bidirectional => Some(Field::new(
-                self.name.clone(),
-                quote! { BiLstm },
-                quote! {
-                    let #name = BiLstmConfig::new(#d_input, #d_hidden, #bias)
-                        .with_batch_first(#batch_first)
-                        .with_input_forget(#input_forget)
-                        #clip_config
-                        #activations_config
-                        .init(device);
-                },
-            )),
-        }
+        let (ty, init) = module_parts(self, quote! { device });
+        rnn_common::field(&self.name, &self.inputs, ty, init)
     }
 
     fn collect_snapshots(&self, field_name: &str) -> Vec<TensorSnapshot> {
@@ -370,7 +408,15 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
 
     fn forward(&self, scope: &mut ScopeAtPosition<'_>) -> TokenStream {
         let input = scope.arg(self.inputs.first().unwrap());
-        let field = Ident::new(&self.name, Span::call_site());
+        let ModuleExpr { setup, expr } = rnn_common::module(
+            &self.name,
+            &self.inputs,
+            scope,
+            &GATE_LAYOUT,
+            self.config.hidden_size,
+            self.config.direction.num_directions(),
+            || module_parts(self, quote! { &self.device }).1,
+        );
 
         // Get output variable names
         let output_y = self.outputs.first().map(arg_to_ident);
@@ -385,6 +431,9 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
         // Input indices: 0=X, 1=W, 2=R, 3=B, 4=sequence_lens, 5=initial_h, 6=initial_c
         // ONNX initial states: [num_directions, batch_size, hidden_size]
         // Burn expects: [batch_size, hidden_size] for unidirectional
+        // initial_h/initial_c carry the direction axis in the same place as Y_h/Y_c, so
+        // layout=1 puts it at 1 rather than 0.
+        let state_axis = state_direction_axis(self.config.batch_first).to_tokens();
         let initial_state_expr = if has_initial_h && has_initial_c {
             // Call order matches emission order so scope's clone tracking
             // works when h_0 and c_0 alias the same ONNX tensor (e.g. both
@@ -397,11 +446,22 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
                 LstmDirection::Forward | LstmDirection::Reverse => {
                     // Squeeze out the direction dimension (index 0) for unidirectional LSTM
                     // ONNX: [1, batch_size, hidden_size] -> Burn: [batch_size, hidden_size]
-                    quote! { Some(LstmState::new(#c_input.squeeze_dim(0), #h_input.squeeze_dim(0))) }
+                    quote! {
+                        Some(LstmState::new(
+                            #c_input.squeeze_dim(#state_axis),
+                            #h_input.squeeze_dim(#state_axis),
+                        ))
+                    }
                 }
                 LstmDirection::Bidirectional => {
-                    // For bidirectional, keep all dimensions but reshape appropriately
-                    quote! { Some(LstmState::new(#c_input, #h_input)) }
+                    // BiLstm wants [2, batch, hidden]; layout=1 hands it [batch, 2, hidden].
+                    if self.config.batch_first {
+                        quote! {
+                            Some(LstmState::new(#c_input.swap_dims(0, 1), #h_input.swap_dims(0, 1)))
+                        }
+                    } else {
+                        quote! { Some(LstmState::new(#c_input, #h_input)) }
+                    }
                 }
             }
         } else {
@@ -411,21 +471,21 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
         // The LSTM module now handles batch_first and reverse internally via config,
         // so no input/output transformation is needed here
         let forward_call = quote! {
-            let (output_seq, final_state) = self.#field.forward(#input, #initial_state_expr);
+            #setup
+            let (output_seq, final_state) = #expr.forward(#input, #initial_state_expr);
         };
 
         // Transform outputs to ONNX format
         // Burn output shape depends on batch_first config:
         //   batch_first=true:  [batch_size, seq_length, hidden_size] or [batch_size, seq_length, 2*hidden_size] for bidirectional
         //   batch_first=false: [seq_length, batch_size, hidden_size] or [seq_length, batch_size, 2*hidden_size] for bidirectional
-        // ONNX Y output: [seq_length, num_directions, batch_size, hidden_size]
-        // Y_h: [num_directions, batch_size, hidden_size]
-        // Y_c: [num_directions, batch_size, hidden_size]
+        // ONNX Y: [seq, dirs, batch, hidden] under layout=0, [batch, seq, dirs, hidden]
+        // under layout=1. Y_h and Y_c: [dirs, batch, hidden] or [batch, dirs, hidden].
 
         // For unidirectional LSTM:
         //   - Burn final_state.hidden/cell: [batch_size, hidden_size] (2D)
         //   - Need to unsqueeze to add num_directions dimension
-        //   - Burn output: [seq, batch, hidden] -> ONNX Y: [seq, 1, batch, hidden]
+        //   - Burn output: [seq, batch, hidden] -> ONNX Y, direction axis per layout
         // For bidirectional LSTM:
         //   - Burn final_state.hidden/cell: [2, batch_size, hidden_size] (already 3D)
         //   - No unsqueeze needed
@@ -434,22 +494,32 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
         let is_bidirectional = matches!(self.config.direction, LstmDirection::Bidirectional);
         let hidden_size = self.config.hidden_size;
 
+        let batch_first = self.config.batch_first;
+        let state_axis = state_direction_axis(batch_first);
         let (hidden_expr, cell_expr) = if is_bidirectional {
-            (quote! { final_state.hidden }, quote! { final_state.cell })
+            // Burn produces [num_directions, batch, hidden]; layout=1 wants batch first.
+            if state_axis == 0 {
+                (quote! { final_state.hidden }, quote! { final_state.cell })
+            } else {
+                (
+                    quote! { final_state.hidden.swap_dims(0, 1) },
+                    quote! { final_state.cell.swap_dims(0, 1) },
+                )
+            }
         } else {
+            let axis = state_axis.to_tokens();
             (
-                quote! { final_state.hidden.unsqueeze_dims::<3>(&[0]) },
-                quote! { final_state.cell.unsqueeze_dims::<3>(&[0]) },
+                quote! { final_state.hidden.unsqueeze_dims::<3>(&[#axis]) },
+                quote! { final_state.cell.unsqueeze_dims::<3>(&[#axis]) },
             )
         };
 
         // Y output transformation
-        // For unidirectional: unsqueeze at dim 1 to add num_directions=1
+        // For unidirectional: unsqueeze at the layout's direction axis
         // For bidirectional: reshape to split the concatenated hidden states, then reorder dims
         //   ONNX layout=0 (batch_first=false): Y is [seq, num_dirs, batch, hidden]
         //   ONNX layout=1 (batch_first=true):  Y is [batch, seq, num_dirs, hidden]
         let y_output_expr = if is_bidirectional {
-            let batch_first = self.config.batch_first;
             if batch_first {
                 // Burn output: [batch, seq, 2*hidden]
                 // Reshape to: [batch, seq, 2, hidden] - already matches ONNX layout=1
@@ -472,7 +542,8 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
                 }
             }
         } else {
-            quote! { output_seq.unsqueeze_dims::<4>(&[1]) }
+            let axis = y_direction_axis(batch_first).to_tokens();
+            quote! { output_seq.unsqueeze_dims::<4>(&[#axis]) }
         };
 
         // Build output assignments based on which outputs are used
@@ -545,16 +616,30 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
             imports.register("burn::nn::ActivationConfig");
         }
 
+        // The module type is only named by the struct field. On the runtime-weight
+        // path there is no field, and importing it would warn in generated code.
+        let needs_module_type = !weights_are_runtime(&self.inputs);
+        // LstmState is only named when an initial state is passed in.
+        let needs_state = self.config.has_initial_h && self.config.has_initial_c;
+
         match self.config.direction {
             LstmDirection::Forward | LstmDirection::Reverse => {
-                imports.register("burn::nn::Lstm");
+                if needs_module_type {
+                    imports.register("burn::nn::Lstm");
+                }
                 imports.register("burn::nn::LstmConfig");
-                imports.register("burn::nn::LstmState");
+                if needs_state {
+                    imports.register("burn::nn::LstmState");
+                }
             }
             LstmDirection::Bidirectional => {
-                imports.register("burn::nn::BiLstm");
+                if needs_module_type {
+                    imports.register("burn::nn::BiLstm");
+                }
                 imports.register("burn::nn::BiLstmConfig");
-                imports.register("burn::nn::LstmState");
+                if needs_state {
+                    imports.register("burn::nn::LstmState");
+                }
             }
         }
     }
@@ -562,7 +647,9 @@ impl NodeCodegen for onnx_ir::lstm::LstmNode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rnn_common::{weights_as_graph_inputs, weights_as_initializers};
     use super::super::test_helpers::*;
+    use crate::burn::node::NodeCodegen;
     use burn::tensor::DType;
     use insta::assert_snapshot;
     use onnx_ir::ir::{ArgType, Argument, TensorType};
@@ -618,9 +705,12 @@ mod tests {
             ));
         }
 
+        let mut inputs = vec![input, w, r, b];
+        weights_as_initializers(&mut inputs);
+
         LstmNode {
             name: name.to_string(),
-            inputs: vec![input, w, r, b],
+            inputs,
             outputs,
             config,
         }
@@ -631,13 +721,7 @@ mod tests {
         let node = create_lstm_node("lstm1", LstmDirection::Forward, false, 3);
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
-        pub fn forward(
-            &self,
-            input: Tensor<3>,
-            W: Tensor<3>,
-            R: Tensor<3>,
-            B: Tensor<2>,
-        ) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+        pub fn forward(&self, input: Tensor<3>) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
             let (Y, Y_h, Y_c) = {
                 let (output_seq, final_state) = self.lstm1.forward(input, None);
                 (
@@ -656,13 +740,7 @@ mod tests {
         let node = create_lstm_node("lstm1", LstmDirection::Bidirectional, false, 3);
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
-        pub fn forward(
-            &self,
-            input: Tensor<3>,
-            W: Tensor<3>,
-            R: Tensor<3>,
-            B: Tensor<2>,
-        ) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+        pub fn forward(&self, input: Tensor<3>) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
             let (Y, Y_h, Y_c) = {
                 let (output_seq, final_state) = self.lstm1.forward(input, None);
                 (
@@ -686,13 +764,7 @@ mod tests {
         let code = codegen_forward_default(&node);
         // Note: reverse is now handled by the LSTM module's config, not by flip() in codegen
         assert_snapshot!(code, @r"
-        pub fn forward(
-            &self,
-            input: Tensor<3>,
-            W: Tensor<3>,
-            R: Tensor<3>,
-            B: Tensor<2>,
-        ) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+        pub fn forward(&self, input: Tensor<3>) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
             let (Y, Y_h, Y_c) = {
                 let (output_seq, final_state) = self.lstm1.forward(input, None);
                 (
@@ -704,5 +776,226 @@ mod tests {
             (Y, Y_h, Y_c)
         }
         ");
+    }
+
+    #[test]
+    fn test_lstm_field_runtime_weights() {
+        let mut node = create_lstm_node("lstm1", LstmDirection::Forward, false, 3);
+        weights_as_graph_inputs(&mut node.inputs);
+        assert!(
+            NodeCodegen::field(&node).is_none(),
+            "runtime weights must not declare a struct field, or `from_file` fails on \
+             tensors no snapshot can supply"
+        );
+    }
+
+    #[test]
+    fn test_lstm_forward_runtime_weights() {
+        let mut node = create_lstm_node("lstm1", LstmDirection::Forward, false, 3);
+        weights_as_graph_inputs(&mut node.inputs);
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r"
+        pub fn forward(
+            &self,
+            input: Tensor<3>,
+            W: Tensor<3>,
+            R: Tensor<3>,
+            B: Tensor<2>,
+        ) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+            let (Y, Y_h, Y_c) = {
+                let mut lstm1 = LstmConfig::new(4, 8, true)
+                    .with_batch_first(false)
+                    .with_input_forget(false)
+                    .init(&self.device);
+                let __w = W;
+                let __r = R;
+                let __b = B;
+                {
+                    let __w_dir = __w.select_dim::<2>(0, 0);
+                    let __r_dir = __r.select_dim::<2>(0, 0);
+                    let __b_dir = __b.select_dim::<1>(0, 0);
+                    let __b_zero = __b_dir.clone().slice_dim(0, 0..8).zeros_like();
+                    lstm1
+                        .input_gate
+                        .input_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __w_dir.clone().slice_dim(0, 0..8).transpose(),
+                    );
+                    lstm1
+                        .input_gate
+                        .hidden_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __r_dir.clone().slice_dim(0, 0..8).transpose(),
+                    );
+                    lstm1
+                        .input_gate
+                        .input_transform
+                        .bias = Some(
+                        burn::module::Param::from_tensor(
+                            __b_dir.clone().slice_dim(0, 0..8)
+                                + __b_dir.clone().slice_dim(0, 32..40),
+                        ),
+                    );
+                    lstm1
+                        .input_gate
+                        .hidden_transform
+                        .bias = Some(burn::module::Param::from_tensor(__b_zero.clone()));
+                    lstm1
+                        .forget_gate
+                        .input_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __w_dir.clone().slice_dim(0, 16..24).transpose(),
+                    );
+                    lstm1
+                        .forget_gate
+                        .hidden_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __r_dir.clone().slice_dim(0, 16..24).transpose(),
+                    );
+                    lstm1
+                        .forget_gate
+                        .input_transform
+                        .bias = Some(
+                        burn::module::Param::from_tensor(
+                            __b_dir.clone().slice_dim(0, 16..24)
+                                + __b_dir.clone().slice_dim(0, 48..56),
+                        ),
+                    );
+                    lstm1
+                        .forget_gate
+                        .hidden_transform
+                        .bias = Some(burn::module::Param::from_tensor(__b_zero.clone()));
+                    lstm1
+                        .output_gate
+                        .input_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __w_dir.clone().slice_dim(0, 8..16).transpose(),
+                    );
+                    lstm1
+                        .output_gate
+                        .hidden_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __r_dir.clone().slice_dim(0, 8..16).transpose(),
+                    );
+                    lstm1
+                        .output_gate
+                        .input_transform
+                        .bias = Some(
+                        burn::module::Param::from_tensor(
+                            __b_dir.clone().slice_dim(0, 8..16)
+                                + __b_dir.clone().slice_dim(0, 40..48),
+                        ),
+                    );
+                    lstm1
+                        .output_gate
+                        .hidden_transform
+                        .bias = Some(burn::module::Param::from_tensor(__b_zero.clone()));
+                    lstm1
+                        .cell_gate
+                        .input_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __w_dir.clone().slice_dim(0, 24..32).transpose(),
+                    );
+                    lstm1
+                        .cell_gate
+                        .hidden_transform
+                        .weight = burn::module::Param::from_tensor(
+                        __r_dir.clone().slice_dim(0, 24..32).transpose(),
+                    );
+                    lstm1
+                        .cell_gate
+                        .input_transform
+                        .bias = Some(
+                        burn::module::Param::from_tensor(
+                            __b_dir.clone().slice_dim(0, 24..32)
+                                + __b_dir.clone().slice_dim(0, 56..64),
+                        ),
+                    );
+                    lstm1
+                        .cell_gate
+                        .hidden_transform
+                        .bias = Some(burn::module::Param::from_tensor(__b_zero.clone()));
+                }
+                let (output_seq, final_state) = lstm1.forward(input, None);
+                (
+                    output_seq.unsqueeze_dims::<4>(&[1]),
+                    final_state.hidden.unsqueeze_dims::<3>(&[0]),
+                    final_state.cell.unsqueeze_dims::<3>(&[0]),
+                )
+            };
+            (Y, Y_h, Y_c)
+        }
+        ");
+    }
+
+    /// ONNX layout=1 moves the direction axis of initial_h/initial_c too.
+    #[test]
+    fn test_lstm_forward_batch_first_initial_state() {
+        let node = with_initial_state(create_lstm_node("lstm1", LstmDirection::Forward, true, 3));
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r"
+        pub fn forward(
+            &self,
+            input: Tensor<3>,
+            sequence_lens: i64,
+            initial_h: Tensor<3>,
+            initial_c: Tensor<3>,
+        ) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+            let (Y, Y_h, Y_c) = {
+                let (output_seq, final_state) = self
+                    .lstm1
+                    .forward(
+                        input,
+                        Some(LstmState::new(initial_c.squeeze_dim(1), initial_h.squeeze_dim(1))),
+                    );
+                (
+                    output_seq.unsqueeze_dims::<4>(&[2]),
+                    final_state.hidden.unsqueeze_dims::<3>(&[1]),
+                    final_state.cell.unsqueeze_dims::<3>(&[1]),
+                )
+            };
+            (Y, Y_h, Y_c)
+        }
+        ");
+    }
+
+    #[test]
+    fn test_lstm_forward_bidirectional_batch_first() {
+        let node = create_lstm_node("lstm1", LstmDirection::Bidirectional, true, 3);
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r"
+        pub fn forward(&self, input: Tensor<3>) -> (Tensor<4>, Tensor<3>, Tensor<3>) {
+            let (Y, Y_h, Y_c) = {
+                let (output_seq, final_state) = self.lstm1.forward(input, None);
+                (
+                    {
+                        let [batch_size, seq_len, _] = output_seq.dims();
+                        output_seq.reshape([batch_size, seq_len, 2, 8usize])
+                    },
+                    final_state.hidden.swap_dims(0, 1),
+                    final_state.cell.swap_dims(0, 1),
+                )
+            };
+            (Y, Y_h, Y_c)
+        }
+        ");
+    }
+
+    /// Give a node the optional inputs an initial state needs, mirroring the ONNX input
+    /// order `X, W, R, B, sequence_lens, initial_h, initial_c`.
+    fn with_initial_state(mut node: LstmNode) -> LstmNode {
+        node.config.has_initial_h = true;
+        node.config.has_initial_c = true;
+        node.inputs.push(Argument::new(
+            "sequence_lens",
+            ArgType::ScalarNative(DType::I64),
+        ));
+        for name in ["initial_h", "initial_c"] {
+            node.inputs.push(Argument::new(
+                name,
+                ArgType::Tensor(TensorType::new(DType::F32, 3, None)),
+            ));
+        }
+        node
     }
 }

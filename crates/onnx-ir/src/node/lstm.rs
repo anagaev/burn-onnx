@@ -12,6 +12,7 @@
 use crate::ir::{ArgType, Argument, Node, RawNode, TensorType};
 use crate::processor::{
     InputSpec, NodeProcessor, NodeSpec, OutputPreferences, OutputSpec, ProcessError,
+    lift_all_or_none, validate_uniform_group,
 };
 use derive_new::new;
 use onnx_ir_derive::NodeBuilder;
@@ -175,17 +176,10 @@ impl NodeProcessor for LstmProcessor {
     }
 
     fn lift_constants(&self, node: &mut RawNode, _opset: usize) -> Result<(), ProcessError> {
-        // W (weights) and R (recurrence weights) are typically constants
-        if node.inputs.len() > 1 && node.inputs[1].is_constant() {
-            node.inputs[1].to_static()?;
-        }
-        if node.inputs.len() > 2 && node.inputs[2].is_constant() {
-            node.inputs[2].to_static()?;
-        }
-        // B (bias) is optional but typically constant
-        if node.inputs.len() > 3 && node.inputs[3].is_constant() {
-            node.inputs[3].to_static()?;
-        }
+        // W, R and the optional B are lifted together or not at all: a partly lifted
+        // group would leave one weight named and another with its name cleared by
+        // `to_static`, which downstream code cannot consume as a unit.
+        lift_all_or_none(node, &[1, 2, 3])?;
         // P (peephole) is optional but typically constant
         if node.inputs.len() > 7 && node.inputs[7].is_constant() {
             node.inputs[7].to_static()?;
@@ -217,6 +211,10 @@ impl NodeProcessor for LstmProcessor {
                 input_tensor.rank
             )));
         }
+
+        // W, R and the optional B are consumed as one group, either all from the graph's
+        // initializers or all from its inputs.
+        validate_uniform_group(node, &[1, 2, 3], &[1, 2])?;
 
         // Validate weight tensor (W)
         let weight_tensor = match &node.inputs[1].ty {
