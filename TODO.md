@@ -7,7 +7,8 @@ the output against `burn 0.22.0-pre.1` with the `flex` backend.
 
 The `Size` codegen fix and the scoreboard re-triage that produced this baseline landed in #457, and
 the domain-aware unsupported-op error (#433) turned out to be already fixed on `main`. Counts below
-are the current state of `expectations.toml`, including this branch's Upsample promotion.
+are the current state of `expectations.toml`, including the Upsample promotion (item 1) and the
+runtime-`axes` reduce fix (item 2).
 
 ## Scoreboard baseline
 
@@ -15,13 +16,13 @@ are the current state of `expectations.toml`, including this branch's Upsample p
 
 | Status         | Rows |
 | -------------- | ---: |
-| `pass`         |  812 |
-| `fail-compare` |  216 |
+| `pass`         |  921 |
+| `fail-compare` |  107 |
 | `skip-codegen` |  484 |
 | `skip-compile` |  103 |
 
-710 of those execute as harness tests. The rest are codegen-only: build.rs skips harness generation
-for dynamic shapes, rank-0 I/O, and dtypes the `.pb` loader cannot construct.
+819 of the 921 `pass` rows execute as harness tests. The other 102 are codegen-only: build.rs skips
+harness generation for dynamic shapes, rank-0 I/O, and dtypes the `.pb` loader cannot construct.
 
 ### Why skip counts rot
 
@@ -37,7 +38,7 @@ unblock a family.
 
 ### What "pass" does and does not mean
 
-812 rows are marked `pass`; 706 of them execute as harness tests. The other 106 are codegen-only:
+921 rows are marked `pass`; 819 of them execute as harness tests. The other 102 are codegen-only:
 `build.rs` skips harness generation for dynamic shapes, rank-0 I/O, and dtypes the `.pb` loader
 cannot construct, and `update-expectations` can only demote a row whose test failed. A codegen-only
 row is therefore unfalsifiable once promoted, and its output is never compared against the
@@ -47,7 +48,12 @@ them into the total.
 `test_size` and `test_size_example` are in that group (the Size fix is verified by the
 `crates/onnx-tests/tests/size/` integration tests, not by the official suite), as are 26
 `test_castlike_*` rows converting to FLOAT8/INT4 variants. Extending the harness to cover them is
-separate work; the honest reading of 812 is "812 compile, 706 match".
+separate work; the honest reading of 921 is "921 compile, 819 match".
+
+Item 2 turned four of those unfalsifiable rows into real tests and immediately found a bug in two
+of them, which is the concrete cost of the category: `test_reduce_log_sum_exp_do_not_keepdims_*`
+were marked `pass` while producing a rank-0 output the harness declines to drive. Correcting the
+inferred rank gave them a driver, and the driver failed.
 
 ## Tier 1
 
@@ -105,41 +111,102 @@ Scoreboard: `test_upsample_nearest` moved from `skip-codegen` to `pass`. Opset c
 
 ### 2. Reduce family comparison failures (99 tests)
 
-The largest `fail-compare` bucket, and the worst failure mode to leave sitting: these compile and
-run, and produce wrong numbers. The re-triage grew this from 88 to 99 by promoting reduce rows that
-turned out to compile and then miscompare.
+**Status: done (#459).** 96 of the 99 rows shared one root cause, and it was the one #459 named. Opset 18
+moved `axes` from an attribute to an input; when that input is a graph input rather than a constant
+its value is unknown at build time, and `ReduceConfig::dims` was a plain `Vec<usize>` that recorded
+that case as an empty vector — the same value ONNX uses for "no axes given, reduce everything".
+Codegen then emitted `.sum()` / `.mean()` with no dimension argument and dropped the axes input on
+the floor. Every one of those models supplies `axes` this way; none of them was a keepdims or
+broadcasting bug. The other 3 are a separate bug, described at the end of this item.
 
-| Family      | Tests |
-| ----------- | ----: |
-| reduce_sum  |    24 |
-| reduce_log  |    18 |
-| reduce_l1   |    14 |
-| reduce_l2   |    14 |
-| reduce_max  |     8 |
-| reduce_min  |     8 |
-| reduce_prod |     7 |
-| reduce_mean |     6 |
+The fix is to make the three meanings of "empty axes" distinguishable, which they are not in a
+`Vec`:
 
-Likely a shared root cause in keepdims / empty-axes / `noop_with_empty_axes`.
+| ONNX                                  | `ReduceConfig::axes`  | Behavior                |
+| ------------------------------------- | --------------------- | ----------------------- |
+| `axes` absent, or an empty list       | `Static(vec![])`      | reduce every axis       |
+| empty list with `noop_with_empty_axes`| `Static(vec![])`      | skip the reduction      |
+| `axes` supplied at run time           | `Runtime(input_ref)`  | reduce what it names    |
 
-The Size fix produced a sharp reproducer for part of this. Once the 19 `rms_normalization_*_expanded`
-models compile, exactly 6 pass: the `axis0` and `axis_negative_<rank>` variants. Every other axis is
-off by a uniform relative factor. The generated code is
+`ReduceConfig` now carries `axes: ReduceAxes`, the `Static(..) | Runtime(RuntimeInputRef)` enum that
+22 other node files already use, plus the `noop_with_empty_axes` attribute it was previously
+discarding. "Skip the reduction" is not quite "identity": the spec says other operations still
+happen, so `ReduceSumSquare` still squares and `ReduceL1` still takes an absolute value.
+
+Reducing over axes that are not compile-time constants sounds like it should be impossible against
+Burn's statically-ranked tensors, and it very nearly is — but only the output *rank* has to be
+static, not the axis values. Burn 0.22's `sum_dims`/`mean_dims`/`max_dims`/`min_dims`/`prod_dims`
+and `squeeze_dims::<D2>` all take `&[impl AsIndex]`, a runtime slice, and `AsIndex::try_dim_index`
+wraps negative entries itself, so a runtime axis and a negative axis both come out correct with no
+work in the generated code. The rank comes from two places: with `keepdims=1` it is the input rank,
+and with `keepdims=0` it is `input_rank - len(axes)`, where the *length* is in the axes input's
+static shape even when its values are not. All 99 models declare that length. When they do not
+(a `Range`-computed axes list) and `keepdims` is off, onnx-ir now refuses the model instead of
+guessing.
+
+Generated code for a runtime-axes reduce reads the axes once and hands the slice to Burn:
 
 ```rust
-let reducemean1_out1 = { mul1_out1.mean().expand([1; 2usize]) };
+let __axes: alloc::vec::Vec<i64> = axes.into_data().iter::<i64>().collect();
+data.abs().sum_dims(&__axes).squeeze_dims::<2usize>(&__axes)
 ```
 
-`mean()` with no argument reduces over *all* elements, so it is only correct when `axis` names the
-first dimension and the reduction therefore covers the whole tensor. It should reduce over the axes
-from `axis` onward. Those 13 are tracked as `fail-compare` against #311.
+Two things surfaced while doing it that were not in the original diagnosis:
 
-Filed as **#459**: opset 18 moved `axes` from an attribute to an input, and a runtime `axes` input
-leaves `ReduceConfig::dims` empty (`onnx-ir/src/node/reduce.rs:275`), which burn-onnx cannot tell
-apart from "no axes given, reduce everything" (`burn-onnx/src/burn/node/reduce.rs:81`). Whether the
-rest of this 99-row bucket shares that cause is unverified, but it is the cheapest confirmed way in.
-`noop_with_empty_axes` is a third unhandled meaning for empty axes and should be settled in the same
-fix.
+- **LogSumExp was wrong for `keepdims=0` independently of the axes bug.** It subtracts a running
+  max from the input, so that max has to keep its rank to broadcast back; squeezing it first made
+  `expand(input_shape)` either wrong or a hard `Squeeze` panic. Both intermediate reductions now run
+  with keepdims and the reduced axes are dropped once at the end. This was invisible before because
+  the two affected rows inferred a rank-0 output, which `build.rs` declines to generate a driver for
+  — they were marked `pass` and never ran.
+- **Out-of-range axes were accepted.** `dim as usize` on a negative that did not wrap left a huge
+  index; `extract_config` now returns `ProcessError::InvalidAttribute` naming the axis and the rank.
+
+Scoreboard: 109 rows promoted from `fail-compare` to `pass` — 96 of the 99 reduce rows and all 13
+remaining `rms_normalization_*_expanded` rows, which used `Shape -> Size -> Range` to build their
+axes at run time. Harness tests went from 706 to 819, all green.
+
+A multi-agent review after the fact turned up two more silent-wrong-answer cases in the first
+draft of this work, both now fixed and both worth recording because they are the same shape as the
+bug being fixed:
+
+- **`noop_with_empty_axes` was lowered to a bare identity.** The spec says the reduction is skipped
+  but "other operations will be performed", so `ReduceSumSquare` must still square, `ReduceL1` and
+  `ReduceL2` must still take an absolute value, and `ReduceLogSum` must still take a log. Only the
+  five plain reductions are genuine identities. Modelling this as "reduce over no axes" rather than
+  an early return makes each composite land on the right answer through machinery that already
+  exists - `ReduceL2` becomes `sqrt(square(x))`, `ReduceLogSumExp` becomes `x + log(exp(x - x))`.
+  The reductions that *are* identities now implement `NodeProcessor::is_noop`, so the framework
+  drops those nodes in post-processing instead of codegen emitting a rebinding; the codegen path
+  stays for `simplify(false)`, where only Identity is eliminated.
+- **A runtime axes list that is empty at run time.** Burn's `*_dims` fold over an empty slice is the
+  identity, but ONNX reads empty axes as "every dimension" unless `noop_with_empty_axes` is set.
+  Only reachable when the axes input has no statically known length, which is exactly the case the
+  opset 18 input shape exists for. The generated code now resolves the list where its length is
+  finally known.
+
+Two structural validations were added alongside: an axis count larger than the input rank used to
+underflow `tensor_rank - axis_count` and panic with no node name, and duplicate axes built cleanly
+and then panicked inside Burn's `squeeze_dims`, which deduplicates and so disagreed with the rank
+onnx-ir had declared.
+
+Note for the `build_node` item in Tier 3: Reduce is now the second operator, after Upsample, with
+validation that can first become reachable in `build_node` (an out-of-range axis behind a
+`Constant -> Identity -> Reduce` chain). Its panic at least names the node and formats the error
+with `Display` now, but the underlying hazard is unchanged.
+
+The 3 reduce rows left are `test_reduce_max_empty_set`, `test_reduce_min_empty_set` and
+`test_reduce_log_sum_exp_empty_set`, which are a different bug: reducing over a zero-size dimension,
+where ONNX mandates the identity element (`-inf` for max, `+inf` for min) and Burn's kernels return
+something else. Sum, prod, L1, L2 and LogSum over an empty set all pass, because their identity
+elements are 0 and 1 and Burn agrees. This belongs upstream in burn, not here.
+
+Also fixed in the same pass, since it was blocking clean `retriage` runs: **#460**, non-deterministic
+attribute-validation errors. `Attributes` was a `HashMap`, whose iteration order Rust reseeds per
+process, so a model with two rejected attributes reported whichever one the loop happened to reach
+first. It is now a `BTreeMap`; the type change is one line and the fallout was the 5 construction
+sites the issue predicted plus their test helpers. `test_resize_downsample_sizes_nearest_not_smaller`
+reported `axes` on 8 of 8 runs afterwards, against 1-of-6 before.
 
 ### 3. Runtime weight inputs: LayerNorm (#352, 19 tests) + Conv/ConvTranspose (#346, 12 tests)
 
@@ -148,10 +215,11 @@ a baked-in `Param` field. Five ops have now hit this pattern; extract the shared
 `runtime_scalar_to_native(arg, target_dtype, scope)` helper in `argument_helpers.rs` proposed in the
 #314 thread before doing these two.
 
-### 4. RMSNormalization (19 tests, +19 more once item 2 lands)
+### 4. RMSNormalization (19 tests)
 
 Burn has `RmsNorm` natively and ONNX 23 made this a first-class op. High real-world relevance:
-Llama, Qwen and Gemma all use it.
+Llama, Qwen and Gemma all use it. The 19 `_expanded` rows this item used to also claim now pass on
+the decomposition alone (item 2); the 19 left are the native op, still `skip-codegen`.
 
 ### 5. Remaining compile-error clusters
 
@@ -217,7 +285,7 @@ those reject the model with a clear error instead of accepting it and computing 
   on the backend people ship on outweighs op-count wins. Root cause probably belongs upstream in
   burn, but it surfaces here.
 - **Resize shares every gap Upsample just closed (surfaced by the item 1 review).** None of it is
-  new and none of it blocked item 1, but it is all in `crates/burn-onnx/src/burn/node/resize.rs`
+  new and none of it blocked item 1, but it is all in `crates/burn-onnx/src/import/burn/node/resize.rs`
   and its processor:
   - Accepts `asymmetric` linear and computes half-pixel values (#311 already tracks
     `test_resize_upsample_scales_cubic_asymmetric` as `fail-compare`).
@@ -258,12 +326,13 @@ those reject the model with a clear error instead of accepting it and computing 
 
 ## Order
 
-Item 1 is done. Item 2 (reduce family) is next.
+Items 1 and 2 are done, and #460 landed alongside item 2. Item 6 (#458) is next: it is the last
+known silent-wrong-answer bug on the board, and the argument that pulled item 2 ahead of the
+test-count work applies to it unchanged — a GRU/LSTM/RNN whose runtime `W`/`R` are dropped still
+runs, with fully random weights, under `Model::new`.
 
-Then 3 -> 4, each measurable against an honest baseline. Items 2 and 6 are both
-silent-wrong-answer bugs (#459, #458), which argues for pulling them ahead of the pure test-count
-work. #460 (non-deterministic attribute errors) should land early too: it is small, and until it
-does, every `retriage` run churns a couple of rows for no reason.
+Then 3 -> 4, each measurable against an honest baseline. Item 3 shares item 6's shape (runtime
+weights that codegen assumes are static), so doing 6 first may well produce the helper 3 needs.
 
 Item 5's top three rows (34 + 22 + 22 = 78 of the 103 remaining `skip-compile` rows) are probably
-two fixes, which makes that bucket competitive with item 2 on effort-per-test.
+two fixes, which makes that bucket the largest remaining test-count win now that item 2 is spent.

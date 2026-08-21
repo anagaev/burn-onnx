@@ -3,7 +3,7 @@
 //! This module contains the AttributeValue enum which represents various types
 //! of attributes that can be attached to ONNX nodes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -153,7 +153,13 @@ pub(crate) enum AttributeValue {
     Graphs(Vec<OnnxGraph>),
 }
 
-pub type Attributes = HashMap<String, AttributeValue>;
+/// Node attributes, keyed by ONNX attribute name.
+///
+/// Deliberately a `BTreeMap` rather than a `HashMap`: processors validate attributes by
+/// iterating this map, and Rust reseeds the default hasher per process, so a `HashMap`
+/// made the reported error depend on which attribute the loop happened to reach first.
+/// Ordered iteration is what makes those diagnostics reproducible (tracel-ai/burn-onnx#460).
+pub type Attributes = BTreeMap<String, AttributeValue>;
 
 /// Scalar/tensor attribute values exposed to custom-op hooks.
 ///
