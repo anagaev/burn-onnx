@@ -88,9 +88,10 @@ fn calculate_dim_slice_output_len(start: i64, end: i64, step: i64, dim_size: usi
 
     // For step > 0, valid endpoints are [0, dim_len]: start at dim_len means
     // empty slice; end at dim_len means slice to the last element.
-    // For step < 0, start must reference a real index [0, dim_len-1] (we cannot
-    // begin iterating from past the end), and end ranges over [-1, dim_len-1]
-    // where -1 represents the conceptual position before the first element.
+    // For step < 0, both endpoints range over [-1, dim_len-1], where -1 is the
+    // conceptual position before the first element. A start that resolves below
+    // -1 begins there and so selects nothing, matching numpy and the ONNX
+    // reference evaluator.
     let (norm_start, norm_end) = if step > 0 {
         (
             normalize_index(start, 0, dim_len, dim_len),
@@ -98,7 +99,7 @@ fn calculate_dim_slice_output_len(start: i64, end: i64, step: i64, dim_size: usi
         )
     } else {
         (
-            normalize_index(start, 0, dim_len - 1, dim_len),
+            normalize_index(start, -1, dim_len - 1, dim_len),
             normalize_index(end, -1, dim_len - 1, dim_len),
         )
     };
@@ -107,7 +108,9 @@ fn calculate_dim_slice_output_len(start: i64, end: i64, step: i64, dim_size: usi
     if range_len <= 0 {
         0
     } else {
-        ((range_len + step.abs() - 1) / step.abs()) as usize
+        // `step` comes straight from the model: `abs()` would overflow on
+        // i64::MIN, and rounding up in i64 would overflow on a huge step.
+        (range_len as u64).div_ceil(step.unsigned_abs()) as usize
     }
 }
 
@@ -182,6 +185,36 @@ impl NodeProcessor for SliceProcessor {
 
         match input_ty {
             ArgType::Tensor(tensor_type) => {
+                // Codegen only honours `steps` when both bounds are static. The
+                // runtime-bound paths emit a plain forward range, so a non-unit
+                // step there would silently slice the wrong elements. Reject the
+                // combination rather than ignoring the step, mirroring the guard
+                // the Shape input path already applies below.
+                //
+                // A runtime `steps` alongside runtime bounds stays allowed: the
+                // ONNX backend test suite passes all four as graph inputs, and
+                // the value cannot be checked here. Those models are assumed to
+                // step by 1, which is what every exporter emits.
+                let runtime_bounds = matches!(config.starts, SliceInput::Runtime(_))
+                    || matches!(config.ends, SliceInput::Runtime(_));
+                match &config.steps {
+                    Some(SliceInput::Runtime(_)) if !runtime_bounds => {
+                        return Err(ProcessError::Custom(format!(
+                            "Slice with static bounds needs static steps; node {} has a runtime steps input",
+                            node.name
+                        )));
+                    }
+                    Some(SliceInput::Static(steps))
+                        if runtime_bounds && steps.iter().any(|&s| s != 1) =>
+                    {
+                        return Err(ProcessError::Custom(format!(
+                            "Slice with runtime bounds only supports step=1; node {} has steps={:?}",
+                            node.name, steps
+                        )));
+                    }
+                    _ => {}
+                }
+
                 // Slice changes dimension sizes along sliced axes. Initialize all dimensions
                 // with sizes from input, then overwrite the axes we can compute statically.
                 let mut static_shape = tensor_type
@@ -698,10 +731,8 @@ mod tests {
 
     #[test]
     fn test_slice_config_runtime() {
-        // Test with runtime inputs (no static values)
-        let node = create_runtime_slice_node().build();
-
-        let mut node = node;
+        // Test with runtime bounds (starts/ends have no static values)
+        let mut node = create_runtime_slice_node().build_with_graph_data(16);
 
         let processor = SliceProcessor;
 
@@ -715,13 +746,17 @@ mod tests {
             (SliceInput::Runtime(starts), SliceInput::Runtime(ends)) => {
                 assert_eq!(starts.name, "starts");
                 assert_eq!(ends.name, "ends");
-                // Check axes and steps
-                if let Some(SliceInput::Static(axes)) = &result.axes {
-                    assert_eq!(axes, &vec![0]);
-                }
-                if let Some(SliceInput::Static(steps)) = &result.steps {
-                    assert_eq!(steps, &vec![1]);
-                }
+                // Constant axes/steps must lift, not degrade to runtime.
+                assert!(
+                    matches!(&result.axes, Some(SliceInput::Static(axes)) if axes == &vec![0]),
+                    "expected static axes, got {:?}",
+                    result.axes
+                );
+                assert!(
+                    matches!(&result.steps, Some(SliceInput::Static(steps)) if steps == &vec![1]),
+                    "expected static steps, got {:?}",
+                    result.steps
+                );
             }
             _ => panic!("Expected runtime config"),
         }
@@ -806,6 +841,89 @@ mod tests {
         let prefs = OutputPreferences::new();
         let result = processor.infer_types(&mut node, 16, &prefs);
         assert!(matches!(result, Err(ProcessError::Custom(ref m)) if m.contains("single-axis")));
+    }
+
+    #[test]
+    fn test_slice_tensor_runtime_bounds_non_unit_step_rejected() {
+        // The runtime-bound tensor codegen emits a plain forward range and
+        // drops `steps` entirely, so a non-1 step would slice the wrong
+        // elements with no diagnostic anywhere.
+        for step in [-1, 2] {
+            let mut node = TestNodeBuilder::new(NodeType::Slice, "tensor_runtime_step")
+                .input_tensor_f32("data", 2, None)
+                .input_tensor_i64("starts", 1, None)
+                .input_tensor_i64("ends", 1, None)
+                .input_tensor_i64_data("axes", vec![0], vec![1])
+                .input_tensor_i64_data("steps", vec![step], vec![1])
+                .output_default("output")
+                .build_with_graph_data(16);
+
+            let processor = SliceProcessor;
+            let result = processor.infer_types(&mut node, 16, &OutputPreferences::new());
+            assert!(
+                matches!(result, Err(ProcessError::Custom(ref m)) if m.contains("step=1")),
+                "step {step} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slice_tensor_runtime_steps_with_static_bounds_rejected() {
+        // The static-bounds codegen path requires a static `steps`; without
+        // this guard it panics instead.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "tensor_runtime_steps")
+            .input_tensor_f32("data", 2, None)
+            .input_tensor_i64_data("starts", vec![0], vec![1])
+            .input_tensor_i64_data("ends", vec![2], vec![1])
+            .input_tensor_i64_data("axes", vec![0], vec![1])
+            .input_tensor_i64("steps", 1, None)
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        let result = processor.infer_types(&mut node, 16, &OutputPreferences::new());
+        assert!(
+            matches!(result, Err(ProcessError::Custom(ref m)) if m.contains("static steps")),
+            "runtime steps with static bounds should be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_slice_tensor_all_runtime_allowed() {
+        // The ONNX backend test suite's `test_slice` passes starts, ends, axes
+        // and steps all as graph inputs. Nothing can be checked statically
+        // there, so it must still import.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "tensor_all_runtime")
+            .input_tensor_f32("data", 2, None)
+            .input_tensor_i64("starts", 1, None)
+            .input_tensor_i64("ends", 1, None)
+            .input_tensor_i64("axes", 1, None)
+            .input_tensor_i64("steps", 1, None)
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .expect("fully runtime Slice params must still import");
+    }
+
+    #[test]
+    fn test_slice_tensor_runtime_bounds_unit_step_allowed() {
+        // The supported combination must keep working.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "tensor_runtime_step1")
+            .input_tensor_f32("data", 2, None)
+            .input_tensor_i64("starts", 1, None)
+            .input_tensor_i64("ends", 1, None)
+            .input_tensor_i64_data("axes", vec![0], vec![1])
+            .input_tensor_i64_data("steps", vec![1], vec![1])
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .expect("runtime bounds with step=1 are supported");
     }
 
     #[test]
@@ -1020,7 +1138,7 @@ mod tests {
     #[test]
     fn test_tensor_static_shape_runtime_inputs_all_none() {
         // Slice axis 0: size=None, start=None, end=None, step=1
-        let mut node = create_runtime_slice_node().build();
+        let mut node = create_runtime_slice_node().build_with_graph_data(16);
 
         let processor = SliceProcessor;
         processor
@@ -1037,6 +1155,36 @@ mod tests {
             },
             other => panic!("Expected tensor, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_dim_slice_output_len_sentinels_and_extreme_steps() {
+        // i64::MIN for `ends` with step < 0 means "past the first element":
+        // adding dim_len keeps it far below zero, so it clamps to -1 and the
+        // whole axis is in range, with `step` then thinning it.
+        assert_eq!(calculate_dim_slice_output_len(7, i64::MIN, -1, 8), 8);
+        assert_eq!(calculate_dim_slice_output_len(-1, i64::MIN, -1, 8), 8);
+        assert_eq!(calculate_dim_slice_output_len(7, i64::MIN, -3, 8), 3);
+
+        // i64::MAX for `ends` with step > 0 clamps to dim_len.
+        assert_eq!(calculate_dim_slice_output_len(3, i64::MAX, 1, 8), 5);
+
+        // The opposite sentinel on each path selects nothing.
+        assert_eq!(calculate_dim_slice_output_len(3, i64::MIN, 1, 8), 0);
+        assert_eq!(calculate_dim_slice_output_len(3, i64::MAX, -1, 8), 0);
+
+        // A reverse start below -dim begins before the first element, so it
+        // selects nothing (numpy and the ONNX reference agree; the spec prose
+        // saying starts clamp into [0, dim-1] is misleading here).
+        assert_eq!(calculate_dim_slice_output_len(-100, i64::MIN, -1, 5), 0);
+        assert_eq!(calculate_dim_slice_output_len(-6, i64::MIN, -1, 5), 0);
+        assert_eq!(calculate_dim_slice_output_len(-5, i64::MIN, -1, 5), 1);
+        assert_eq!(calculate_dim_slice_output_len(99, i64::MIN, -1, 5), 5);
+
+        // Steps come from the model unchecked, so the extremes must not
+        // overflow while rounding the range length up.
+        assert_eq!(calculate_dim_slice_output_len(0, 10, i64::MAX, 10), 1);
+        assert_eq!(calculate_dim_slice_output_len(9, 0, i64::MIN, 10), 1);
     }
 
     #[test]
