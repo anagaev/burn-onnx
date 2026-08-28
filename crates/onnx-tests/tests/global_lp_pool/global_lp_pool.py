@@ -33,12 +33,11 @@ def build_model(p, suffix, input_shape=(2, 3, 4)):
     input_info = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, list(input_shape)
     )
-    output_shape = [1] * len(input_shape)
-    for i in range(0, 2):
-        output_shape[i] = input_shape[i]
+    # N and C carry through; every spatial dim collapses to 1.
+    output_shape = list(input_shape[:2]) + [1] * (len(input_shape) - 2)
 
     output_info = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, list(output_shape)
+        "output", TensorProto.FLOAT, output_shape
     )
 
     graph = helper.make_graph(
