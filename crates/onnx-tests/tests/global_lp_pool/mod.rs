@@ -4,6 +4,8 @@ include_models!(
     global_lp_pool_l1,
     global_lp_pool_l2,
     global_lp_pool_l3,
+    global_lp_pool_rank_4_l1,
+    global_lp_pool_rank_4_l2,
     global_lp_pool_rank_4_l3
 );
 
@@ -12,8 +14,8 @@ mod tests {
     use super::*;
     use burn::tensor::{Device, Tensor, TensorData, Tolerance};
 
-    // Input generated via np.random.seed(42), shape [2, 3, 4]. Shared across all
-    // tests so different axis/p configurations operate on the same data.
+    // Input generated via np.random.seed(42), shape [2, 3, 4]. Shared by the rank-3
+    // tests so every p operates on the same data.
     fn test_input_rank_3(device: &Device) -> Tensor<3> {
         Tensor::<3>::from_floats(
             [
@@ -32,6 +34,8 @@ mod tests {
         )
     }
 
+    // Input generated via np.random.seed(42), shape [2, 3, 2, 3]. Shared by the
+    // rank-4 tests.
     fn test_input_rank_4(device: &Device) -> Tensor<4> {
         Tensor::<4>::from_floats(
             [
@@ -68,6 +72,8 @@ mod tests {
         )
     }
 
+    // `p` defaults to 2, so this asserts the same values as `global_lp_pool_l2`.
+    // What it actually covers is that the attribute is optional.
     #[test]
     fn global_lp_pool_default() {
         let device = Default::default();
@@ -128,6 +134,38 @@ mod tests {
         let expected = TensorData::from([
             [[1.5780534], [1.6406361], [0.77402496]],
             [[2.3101003], [1.6673921], [1.8223873]],
+        ]);
+
+        output
+            .to_data()
+            .assert_approx_eq::<f32>(&expected, Tolerance::default());
+    }
+
+    #[test]
+    fn global_lp_pool_input_rank_4_l1() {
+        let device = Default::default();
+        let model: global_lp_pool_rank_4_l1::Model = global_lp_pool_rank_4_l1::Model::default();
+
+        let output = model.forward(test_input_rank_4(&device));
+        let expected = TensorData::from([
+            [[[3.273987]], [[4.2878294]], [[5.769526]]],
+            [[[5.5040293]], [[3.0743294]], [[5.5685816]]],
+        ]);
+
+        output
+            .to_data()
+            .assert_approx_eq::<f32>(&expected, Tolerance::default());
+    }
+
+    #[test]
+    fn global_lp_pool_input_rank_4_l2() {
+        let device = Default::default();
+        let model: global_lp_pool_rank_4_l2::Model = global_lp_pool_rank_4_l2::Model::default();
+
+        let output = model.forward(test_input_rank_4(&device));
+        let expected = TensorData::from([
+            [[[1.7648258]], [[2.0073133]], [[2.85224]]],
+            [[[2.6556878]], [[1.4901153]], [[2.6606314]]],
         ]);
 
         output

@@ -287,6 +287,8 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/global_lp_pool/global_lp_pool_l1.onnx")
         .input("tests/global_lp_pool/global_lp_pool_l2.onnx")
         .input("tests/global_lp_pool/global_lp_pool_l3.onnx")
+        .input("tests/global_lp_pool/global_lp_pool_rank_4_l1.onnx")
+        .input("tests/global_lp_pool/global_lp_pool_rank_4_l2.onnx")
         .input("tests/global_lp_pool/global_lp_pool_rank_4_l3.onnx")
         .input("tests/graph_multiple_output_tracking/graph_multiple_output_tracking.onnx")
         .input("tests/greater/greater.onnx")

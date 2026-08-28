@@ -5,12 +5,13 @@
 //! **ONNX Spec**: <https://onnx.ai/onnx/operators/onnx__GlobalLpPool.html>
 //!
 //! ## Type Constraints
-//! - T: tensor(double), tensor(float), tensor(float16)
+//! - T: tensor(bfloat16), tensor(double), tensor(float), tensor(float16)
 //!
 //! ## Opset Versions
-//! - **Opset 1**: Initial version (types: float16, float, double)
-//!   **Opset 2**: Initial version (types: float16, float, double)
-use crate::ir::{ArgType, Argument, Node, RawNode, TensorType};
+//! - **Opset 1**: Initial version (types: float16, float, double). `p` is a FLOAT attribute.
+//! - **Opset 2**: `p` becomes an INT attribute.
+//! - **Opset 22**: Adds bfloat16 to T.
+use crate::ir::{ArgType, Argument, AttributeValue, Node, RawNode, TensorType};
 use crate::processor::{
     InputSpec, NodeProcessor, NodeSpec, OutputPreferences, OutputSpec, ProcessError,
 };
@@ -49,51 +50,63 @@ impl NodeProcessor for GlobalLpPoolProcessor {
     fn infer_types(
         &self,
         node: &mut RawNode,
-        _opset: usize,
+        opset: usize,
         _output_preferences: &OutputPreferences,
     ) -> Result<(), ProcessError> {
         let arg = node
             .inputs
             .first()
-            .ok_or_else(|| ProcessError::MissingInput("GlobalLpPool: missing input".to_string()))?;
+            .ok_or_else(|| ProcessError::MissingInput("input".to_string()))?;
         let ArgType::Tensor(ref tensor_ty) = arg.ty else {
             return Err(ProcessError::TypeMismatch {
-                expected: "GlobalLpPool: input should be a tensor".to_string(),
+                expected: "Tensor".to_string(),
                 actual: format!("{:?}", arg.ty),
             });
         };
+        // Matches ORT, which reports "Input dimension cannot be less than 3".
         if tensor_ty.rank <= 2 {
             return Err(ProcessError::Custom(format!(
-                "GlobalLpPool: input tensor requires rank at least 3, got rank {}",
+                "input tensor requires rank at least 3, got rank {}",
                 tensor_ty.rank
             )));
-        };
+        }
 
-        if !matches!(tensor_ty.dtype, DType::F16 | DType::F32 | DType::F64) {
+        // bfloat16 joins T at opset 22.
+        let allowed = if opset >= 22 {
+            matches!(
+                tensor_ty.dtype,
+                DType::BF16 | DType::F16 | DType::F32 | DType::F64
+            )
+        } else {
+            matches!(tensor_ty.dtype, DType::F16 | DType::F32 | DType::F64)
+        };
+        if !allowed {
             return Err(ProcessError::TypeMismatch {
-                expected: "DType::F16 | DType::F32 | DType::F64".to_string(),
+                expected: "Floating-point tensor dtype".to_string(),
                 actual: format!("{:?}", tensor_ty.dtype),
             });
         }
 
-        let static_shape = {
-            let mut shape = tensor_ty
-                .static_shape
-                .clone()
-                .unwrap_or_else(|| vec![None; tensor_ty.rank]);
-
-            for el in shape.iter_mut().skip(2) {
-                *el = Some(1usize);
-            }
-            Some(shape)
-        };
-
+        // Validate here so malformed graphs fail before codegen.
         extract_p(node)?;
+
+        // Length comes from `rank`, so it cannot drift from the rank written below
+        // if the input's `static_shape` disagrees with its own rank.
+        let mut static_shape = vec![None; tensor_ty.rank];
+        if let Some(input_shape) = &tensor_ty.static_shape {
+            for (out, inp) in static_shape.iter_mut().zip(input_shape).take(2) {
+                *out = *inp;
+            }
+        }
+        // N and C carry through; every spatial dim collapses to 1.
+        for el in static_shape.iter_mut().skip(2) {
+            *el = Some(1usize);
+        }
 
         node.outputs[0].ty = ArgType::Tensor(TensorType {
             dtype: tensor_ty.dtype,
             rank: tensor_ty.rank,
-            static_shape,
+            static_shape: Some(static_shape),
         });
 
         Ok(())
@@ -118,19 +131,37 @@ impl NodeProcessor for GlobalLpPoolProcessor {
     }
 }
 
+/// Parse `p`, which ONNX declares FLOAT in opset 1 and INT from opset 2 on, so both
+/// representations are accepted. Defaults to 2 per the ONNX spec.
 fn extract_p(node: &RawNode) -> Result<i64, ProcessError> {
-    let p = node
-        .attrs
-        .get("p")
-        .map(|v| v.clone().into_i64())
-        .unwrap_or(2);
+    let p = match node.attrs.get("p") {
+        None => 2,
+        Some(AttributeValue::Int64(p)) => *p,
+        // Opset 1 stores `p` as a float. Only whole values map onto the integer
+        // exponent codegen emits, so reject the rest rather than truncating.
+        Some(AttributeValue::Float32(p)) => {
+            if !p.is_finite() || p.fract() != 0.0 {
+                return Err(ProcessError::InvalidAttribute {
+                    name: "p".to_string(),
+                    reason: format!("expected a whole number, got {p}"),
+                });
+            }
+            *p as i64
+        }
+        Some(other) => {
+            return Err(ProcessError::InvalidAttribute {
+                name: "p".to_string(),
+                reason: format!("expected an INT or FLOAT attribute, got {other:?}"),
+            });
+        }
+    };
 
     if p <= 0 {
-        return Err(ProcessError::Custom(format!(
-            "GlobalLpPool: p must be > 0, got {}",
-            p
-        )));
-    };
+        return Err(ProcessError::InvalidAttribute {
+            name: "p".to_string(),
+            reason: format!("p must be > 0, got {p}"),
+        });
+    }
     Ok(p)
 }
 
@@ -257,8 +288,125 @@ mod tests {
         let processor = GlobalLpPoolProcessor;
         assert!(matches!(
             processor.extract_config(&node, 16),
-            Err(ProcessError::Custom(_))
+            Err(ProcessError::InvalidAttribute { ref name, .. }) if name == "p"
         ));
+    }
+
+    /// `infer_types` must reject a bad `p` too. Without this the validation is only
+    /// reached through `extract_config`, and dropping it makes `build_node` panic on
+    /// its `.expect()` instead of returning a named error.
+    #[test]
+    fn test_global_lp_pool_infer_types_rejects_non_positive_p() {
+        for bad in [-4, 0] {
+            let mut node = create_test_node(Some(bad), 4, None).build();
+            let processor = GlobalLpPoolProcessor;
+            let prefs = OutputPreferences::new();
+            let result = processor.infer_types(&mut node, 16, &prefs);
+            assert!(
+                matches!(result, Err(ProcessError::InvalidAttribute { ref name, .. }) if name == "p"),
+                "p = {bad} should be rejected by infer_types, got {result:?}"
+            );
+        }
+    }
+
+    /// Opset 1 declares `p` as FLOAT. Reading it as an INT used to panic in
+    /// `into_i64` before any validation could run.
+    #[test]
+    fn test_global_lp_pool_opset1_float_p() {
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+            .input_tensor_f32("input", 3, None)
+            .output_tensor_f32("output", 3, None);
+        builder = builder.attr_float("p", 3.0);
+        let node = builder.build();
+        let processor = GlobalLpPoolProcessor;
+        assert_eq!(processor.extract_config(&node, 1).unwrap().p, 3);
+    }
+
+    #[test]
+    fn test_global_lp_pool_opset1_fractional_p_rejected() {
+        let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+            .input_tensor_f32("input", 3, None)
+            .output_tensor_f32("output", 3, None);
+        builder = builder.attr_float("p", 2.5);
+        let node = builder.build();
+        let processor = GlobalLpPoolProcessor;
+        assert!(matches!(
+            processor.extract_config(&node, 1),
+            Err(ProcessError::InvalidAttribute { ref name, .. }) if name == "p"
+        ));
+    }
+
+    /// bfloat16 joins T at opset 22 and must stay rejected before it.
+    #[test]
+    fn test_global_lp_pool_bf16_gated_on_opset() {
+        for (opset, expect_ok) in [(21, false), (22, true)] {
+            let mut builder = TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+                .input_tensor_bf16("input", 3, None)
+                .output_tensor_f32("output", 3, None);
+            builder = builder.attr_int("p", 2);
+            let mut node = builder.build();
+            let processor = GlobalLpPoolProcessor;
+            let prefs = OutputPreferences::new();
+            let result = processor.infer_types(&mut node, opset, &prefs);
+            assert_eq!(
+                result.is_ok(),
+                expect_ok,
+                "bf16 at opset {opset} should be ok={expect_ok}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_global_lp_pool_accepts_f16_and_f64() {
+        let cases: Vec<(DType, TestNodeBuilder)> = vec![
+            (
+                DType::F16,
+                TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+                    .input_tensor_f16("input", 3, None)
+                    .output_tensor_f16("output", 3, None),
+            ),
+            (
+                DType::F64,
+                TestNodeBuilder::new(NodeType::GlobalLpPool, "test_global_lp_pool")
+                    .input_tensor_f64("input", 3, None)
+                    .output_tensor_f64("output", 3, None),
+            ),
+        ];
+        for (dtype, builder) in cases {
+            let mut node = builder.attr_int("p", 2).build();
+            let processor = GlobalLpPoolProcessor;
+            let prefs = OutputPreferences::new();
+            processor.infer_types(&mut node, 16, &prefs).unwrap();
+            let ArgType::Tensor(output_tensor) = &node.outputs[0].ty else {
+                panic!("Expected Tensor output");
+            };
+            assert_eq!(output_tensor.dtype, dtype);
+        }
+    }
+
+    /// The output `static_shape` length is taken from `rank`, so an input whose
+    /// `static_shape` disagrees with its own rank cannot produce a `TensorType`
+    /// that contradicts itself.
+    #[test]
+    fn test_global_lp_pool_static_shape_shorter_than_rank() {
+        let mut node = create_test_node(None, 4, None).build();
+        let ArgType::Tensor(input_ty) = &mut node.inputs[0].ty else {
+            panic!("Expected Tensor input");
+        };
+        input_ty.static_shape = Some(vec![Some(2), Some(3)]);
+
+        let processor = GlobalLpPoolProcessor;
+        let prefs = OutputPreferences::new();
+        processor.infer_types(&mut node, 16, &prefs).unwrap();
+
+        let ArgType::Tensor(output_tensor) = &node.outputs[0].ty else {
+            panic!("Expected Tensor output");
+        };
+        assert_eq!(output_tensor.rank, 4);
+        assert_eq!(
+            output_tensor.static_shape,
+            Some(vec![Some(2), Some(3), Some(1), Some(1)])
+        );
     }
 
     #[test]

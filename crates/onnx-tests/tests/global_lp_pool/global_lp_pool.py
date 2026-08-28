@@ -14,8 +14,7 @@ import onnx
 import onnx.helper as helper
 from onnx import TensorProto
 import onnxruntime as ort
-from onnx.reference import ReferenceEvaluator
-import onnxruntime as ort
+
 
 def build_model(p, suffix, input_shape=(2, 3, 4)):
     np.random.seed(42)
@@ -45,7 +44,8 @@ def build_model(p, suffix, input_shape=(2, 3, 4)):
     graph = helper.make_graph(
         [node], "global_lp_pooling_graph", [input_info], [output_info]
     )
-    # Operator id 22 is not supported yet.
+    # Opset 7 keeps `p` as an INT attribute. Parsing across every opset the operator
+    # exists in is covered by the opset-compliance harness instead.
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 7)])
     model.ir_version = 8
 
@@ -56,6 +56,8 @@ def build_model(p, suffix, input_shape=(2, 3, 4)):
     print(f"Finished exporting model to {file_name}")
 
     test_input = np.random.randn(*input_shape).astype(np.float32)
+    # onnx.reference.ReferenceEvaluator has no GlobalLpPool implementation
+    # (RuntimeImplementationError), so onnxruntime is the only option here.
     session = ort.InferenceSession(file_name, providers=["CPUExecutionProvider"])
     output = session.run(None, {"input": test_input})[0]
 
@@ -72,4 +74,6 @@ if __name__ == "__main__":
     build_model(p=1, suffix="l1")
     build_model(p=2, suffix="l2")
     build_model(p=3, suffix="l3")
+    build_model(p=1, suffix="rank_4_l1", input_shape=(2, 3, 2, 3))
+    build_model(p=2, suffix="rank_4_l2", input_shape=(2, 3, 2, 3))
     build_model(p=3, suffix="rank_4_l3", input_shape=(2, 3, 2, 3))
