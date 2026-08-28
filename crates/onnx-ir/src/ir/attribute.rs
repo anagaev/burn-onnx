@@ -3,7 +3,7 @@
 //! This module contains the AttributeValue enum which represents various types
 //! of attributes that can be attached to ONNX nodes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -153,7 +153,13 @@ pub(crate) enum AttributeValue {
     Graphs(Vec<OnnxGraph>),
 }
 
-pub type Attributes = HashMap<String, AttributeValue>;
+/// Node attributes, keyed by ONNX attribute name.
+///
+/// Deliberately a `BTreeMap` rather than a `HashMap`: processors validate attributes by
+/// iterating this map, and Rust reseeds the default hasher per process, so a `HashMap`
+/// made the reported error depend on which attribute the loop happened to reach first.
+/// Ordered iteration is what makes those diagnostics reproducible (tracel-ai/burn-onnx#460).
+pub type Attributes = BTreeMap<String, AttributeValue>;
 
 /// Scalar/tensor attribute values exposed to custom-op hooks.
 ///
@@ -376,7 +382,6 @@ impl AttributeValue {
         }
     }
 
-    #[allow(dead_code)]
     pub fn into_f32s(self) -> Vec<f32> {
         if let AttributeValue::Float32s(elem) = self {
             elem
@@ -493,10 +498,10 @@ mod tests {
     fn tensor_accessors() {
         let attrs = PublicAttributesOwned::from_internal(&attrs_fixture());
         let window = attrs.get_tensor("window").unwrap();
-        assert_eq!(window.to_vec::<f32>().unwrap(), vec![0.25, 0.75]);
+        assert_eq!(window.try_to_vec::<f32>().unwrap(), vec![0.25, 0.75]);
         let windows = attrs.get_tensors("windows").unwrap();
         assert_eq!(windows.len(), 2);
-        assert_eq!(windows[1].to_vec::<i64>().unwrap(), vec![2, 3]);
+        assert_eq!(windows[1].try_to_vec::<i64>().unwrap(), vec![2, 3]);
     }
 
     #[test]

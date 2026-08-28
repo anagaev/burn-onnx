@@ -1155,10 +1155,13 @@ fn reduce_l1(graph: &OnnxGraph) {
         reducel11_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1174,10 +1177,13 @@ fn reduce_l2(graph: &OnnxGraph) {
         reducel21_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1193,10 +1199,13 @@ fn reduce_log_sum(graph: &OnnxGraph) {
         reducelogsum1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1212,10 +1221,13 @@ fn reduce_log_sum_exp(graph: &OnnxGraph) {
         reducelogsumexp1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1231,10 +1243,13 @@ fn reduce_max(graph: &OnnxGraph) {
         reducemax1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1250,10 +1265,13 @@ fn reduce_mean(graph: &OnnxGraph) {
         reducemean1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1269,10 +1287,13 @@ fn reduce_min(graph: &OnnxGraph) {
         reducemin1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1288,10 +1309,13 @@ fn reduce_prod(graph: &OnnxGraph) {
         reduceprod1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1307,10 +1331,13 @@ fn reduce_sum(graph: &OnnxGraph) {
         reducesum1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1326,10 +1353,13 @@ fn reduce_sum_square(graph: &OnnxGraph) {
         reducesumsquare1_out1: F32[2, 1, 4]
       Config:
         ReduceConfig {
-            dims: [
-                1,
-            ],
+            axes: Static(
+                [
+                    1,
+                ],
+            ),
             keepdims: true,
+            noop_with_empty_axes: false,
         }
     "#);
 }
@@ -1702,6 +1732,37 @@ fn unsqueeze(graph: &OnnxGraph) {
                 3,
             ],
         )
+    "#);
+}
+
+#[rstest]
+fn upsample(graph: &OnnxGraph) {
+    let node = find_node(graph, "upsample");
+    insta::assert_snapshot!(format!("{node}"), @r#"
+    Resize "upsample1"
+      Inputs:
+        upsample_input: F32[1, 1, 2, 2]
+      Outputs:
+        upsample1_out1: F32[1, 1, 4, 4]
+      Config:
+        ResizeConfig {
+            mode: Nearest,
+            scales: Some(
+                Static(
+                    [
+                        2.0,
+                        2.0,
+                    ],
+                ),
+            ),
+            sizes: None,
+            coordinate_transformation_mode: Asymmetric,
+            cubic_coeff_a: -0.75,
+            nearest_mode: Floor,
+            exclude_outside: 0,
+            extrapolation_value: 0.0,
+            antialias: 0,
+        }
     "#);
 }
 

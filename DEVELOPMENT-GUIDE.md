@@ -162,7 +162,7 @@ For example, the squeeze operation in `crates/onnx-ir/src/node/squeeze.rs` conta
 
 ### Step 2: Code Generation in burn-onnx
 
-1. Create a new file named `<operation_name>.rs` in the `crates/burn-onnx/src/burn/node/` directory.
+1. Create a new file named `<operation_name>.rs` in the `crates/burn-onnx/src/import/burn/node/` directory.
    This file implements code generation for your operation by implementing the `NodeCodegen` trait
    directly on the onnx-ir node type.
 
@@ -219,7 +219,7 @@ For example, the squeeze operation in `crates/onnx-ir/src/node/squeeze.rs` conta
    - `outputs(&self)` - Returns references to output arguments (usually just `&self.outputs`)
    - `forward(&self, scope)` - Generates Rust code for the operation using the `quote!` macro
    - `field(&self)` - (Optional) Declares module fields for parameters like weights
-   - `collect_snapshots(&self, field_name)` - (Optional) Collects tensor snapshots for burnpack
+   - `collect_tensors(&self, field_name)` - (Optional) Collects deferred tensors for burnpack
      serialization
 
 3. Use helper utilities from `argument_helpers.rs`:
@@ -272,7 +272,7 @@ For example, the squeeze operation in `crates/onnx-ir/src/node/squeeze.rs` conta
 
 ### Step 3: Register in Module System
 
-Add the module declaration to `crates/burn-onnx/src/burn/node/mod.rs`:
+Add the module declaration to `crates/burn-onnx/src/import/burn/node/mod.rs`:
 
 ```rust
 // ... other node modules
@@ -284,7 +284,7 @@ The modules are automatically made visible through re-exports in the same file.
 
 ### Step 4: Register in Code Generation Dispatch
 
-Add your operation to the dispatch macro in `crates/burn-onnx/src/burn/node_codegen.rs`. The
+Add your operation to the dispatch macro in `crates/burn-onnx/src/import/burn/node_codegen.rs`. The
 `impl_node_codegen_dispatch!` macro generates the trait implementation that dispatches to your
 node-specific code.
 
@@ -472,7 +472,7 @@ Large models (>200 nodes) are automatically partitioned into `SubmoduleN` struct
 generation. Without partitioning, the generated `forward()` method becomes a single enormous
 function that takes very long to compile.
 
-The algorithm (in `crates/burn-onnx/src/burn/partition.rs`):
+The algorithm (in `crates/burn-onnx/src/import/burn/partition.rs`):
 
 1. **Constant reordering**: Moves each constant node to just before its first consumer. ONNX
    exporters typically cluster constants at the top of the graph, which inflates cut widths at
@@ -1113,9 +1113,9 @@ generated code, or `ModelGen::development(true)` which dumps the parsed graph,
 to see the node types your override will actually be matched against.
 
 An override wins over the built-in for every node of the target type,
-including its `field()`/`collect_snapshots()`. The defaults suppress the
+including its `field()`/`collect_tensors()`. The defaults suppress the
 built-in's field, so overriding a weighted op (Conv, Gemm, ...) means
-reimplementing both `field()` and `collect_snapshots()` for it; the built-in
+reimplementing both `field()` and `collect_tensors()` for it; the built-in
 `Field` and its init code are not inherited. Override targets appearing
 inside `If`/`Loop`/`Scan` bodies are rejected at code generation (subgraph
 bodies always use built-in codegen).

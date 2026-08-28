@@ -4,14 +4,16 @@ use std::rc::Rc;
 
 use crate::TensorDataExt;
 use crate::graph_state::GraphState;
-use crate::ir::{ArgType, Argument, DType, NodeType, RawNode, ValueSource};
+use crate::ir::{ArgType, Argument, Attributes, DType, NodeType, RawNode, ValueSource};
 use crate::tensor_store::TensorDataRef;
 
 /// Simplify shape-related patterns when input shapes are statically known.
 ///
-/// Handles two patterns:
+/// Handles three patterns. The first two match on the producing node;
+/// the third matches on the input's type, whatever produced it.
 /// 1. `Shape -> Gather(constant_index)` -> constant scalar
 /// 2. `Shape -> Slice(static starts/ends)` -> constant tensor
+/// 3. `Size` on a `Shape(N)`-typed input -> constant N
 ///
 /// Orphaned nodes are cleaned up by dead node elimination.
 pub(crate) fn simplify_constant_shape(
@@ -87,11 +89,42 @@ pub(crate) fn simplify_constant_shape(
         constant_outputs.push(output_name);
     }
 
-    // Pass 3 (full Shape elimination) is intentionally omitted. While it works when
+    // Pass 3: Size(Shape(N)) -> constant N
+    //
+    // A Shape(N) argument is an [i64; N] array, so its element count is the
+    // rank N, known regardless of what the dimension values turn out to be at
+    // runtime. Unlike passes 1 and 2 this does not consult `static_shape`, so
+    // it is safe for models with dynamic spatial dimensions.
+    let mut size_replacements: Vec<(usize, i64)> = Vec::new();
+    for (si, node) in nodes.iter().enumerate() {
+        if node.node_type != NodeType::Size || node.inputs.is_empty() {
+            continue;
+        }
+        if let ArgType::Shape(rank) = &node.inputs[0].ty {
+            size_replacements.push((si, *rank as i64));
+        }
+    }
+
+    for (si, rank) in &size_replacements {
+        let size_node = &nodes[*si];
+        log::info!(
+            "Simplification: replacing Size of a Shape '{}' with constant {}",
+            size_node.name,
+            rank,
+        );
+
+        let output_name = size_node.outputs[0].name.clone();
+        let output_ty = size_node.outputs[0].ty.clone();
+        let node_name = nodes[*si].name.clone();
+        nodes[*si] = make_constant_node(&node_name, &output_name, &[*rank], output_ty, state);
+        constant_outputs.push(output_name);
+    }
+
+    // Full Shape elimination is intentionally omitted. While it works when
     // static_shape values match runtime shapes, type inference populates static_shape
     // from ONNX export-time values which may differ at runtime for models with dynamic
     // spatial dimensions (e.g., rf-detr). The Shape codegen already handles the dynamic
-    // case correctly via .dims(), so skipping this pass is safe.
+    // case correctly via .dims(), so omitting that fold is safe.
 
     // Update downstream inputs: nodes that reference replaced outputs need
     // ValueSource::Constant so the dead constant elimination pass in
@@ -141,7 +174,7 @@ fn make_constant_node(
             value_source: ValueSource::Constant,
             value_store: Some(value_store),
         }],
-        attrs: HashMap::new(),
+        attrs: Attributes::new(),
     }
 }
 
@@ -404,7 +437,7 @@ mod tests {
         node_type: NodeType,
         inputs: Vec<Argument>,
         outputs: Vec<Argument>,
-        attrs: HashMap<String, AttributeValue>,
+        attrs: Attributes,
     ) -> RawNode {
         RawNode {
             custom_identity: None,
@@ -431,7 +464,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "gather",
@@ -495,7 +528,7 @@ mod tests {
                 NodeType::Relu,
                 vec![arg("input")],
                 vec![arg("relu_out")],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "gather",
@@ -522,7 +555,7 @@ mod tests {
                 NodeType::Shape,
                 vec![arg("input")], // arg() creates tensor with static_shape: None
                 vec![shape_arg("shape_out", 2)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "gather",
@@ -553,14 +586,14 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "consumer",
                 NodeType::Add,
                 vec![shape_arg("shape_out", 3), arg("other")],
                 vec![arg("output")],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -577,7 +610,7 @@ mod tests {
             NodeType::Shape,
             vec![arg("input")], // no static_shape
             vec![shape_arg("shape_out", 2)],
-            HashMap::new(),
+            Attributes::new(),
         )];
 
         let state = test_state();
@@ -596,7 +629,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4, 5])],
                 vec![shape_arg("shape_out", 4)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "slice",
@@ -607,7 +640,7 @@ mod tests {
                     const_i64_vec_arg("ends", &[3]),
                 ],
                 vec![shape_arg("slice_out", 2)],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -629,7 +662,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![10, 20, 30, 40, 50])],
                 vec![shape_arg("shape_out", 5)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "slice",
@@ -642,7 +675,7 @@ mod tests {
                     const_i64_vec_arg("steps", &[2]),
                 ],
                 vec![shape_arg("slice_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -663,7 +696,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "slice",
@@ -674,7 +707,7 @@ mod tests {
                     const_i64_vec_arg("ends", &[3]),
                 ],
                 vec![shape_arg("slice_out", 2)],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -695,7 +728,7 @@ mod tests {
                 NodeType::Relu,
                 vec![arg("input")],
                 vec![arg("relu_out")],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "slice",
@@ -706,7 +739,7 @@ mod tests {
                     const_i64_vec_arg("ends", &[2]),
                 ],
                 vec![arg("slice_out")],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -724,7 +757,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "slice",
@@ -735,7 +768,7 @@ mod tests {
                     const_i64_vec_arg("ends", &[3]),
                 ],
                 vec![shape_arg("slice_out", 2)],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -754,7 +787,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "gather",
@@ -770,7 +803,7 @@ mod tests {
                 NodeType::Add,
                 vec![scalar_arg("dim_val", DType::I64), arg("other")],
                 vec![arg("add_out")],
-                HashMap::new(),
+                Attributes::new(),
             ),
         ];
 
@@ -794,7 +827,7 @@ mod tests {
                 NodeType::Shape,
                 vec![tensor_arg_with_shape("input", vec![2, 3, 4])],
                 vec![shape_arg("shape_out", 3)],
-                HashMap::new(),
+                Attributes::new(),
             ),
             raw_node(
                 "gather",
@@ -814,5 +847,91 @@ mod tests {
         assert_eq!(graph_outputs[0].value_source, ValueSource::Constant);
         let val = graph_outputs[0].value().unwrap().scalar_i64().unwrap();
         assert_eq!(val, 2);
+    }
+
+    // --- Size(Shape) tests ---
+
+    #[test]
+    fn test_size_of_shape_replaced_with_constant() {
+        // tensor(shape=[2,6,2,3]) -> Shape -> Size -> should become const 4
+        let nodes = vec![
+            raw_node(
+                "shape",
+                NodeType::Shape,
+                vec![tensor_arg_with_shape("input", vec![2, 6, 2, 3])],
+                vec![shape_arg("shape_out", 4)],
+                Attributes::new(),
+            ),
+            raw_node(
+                "size",
+                NodeType::Size,
+                vec![shape_arg("shape_out", 4)],
+                vec![scalar_arg("size_out", DType::I64)],
+                Attributes::new(),
+            ),
+        ];
+
+        let state = test_state();
+        let result = simplify_constant_shape(nodes, &mut [], &state);
+        let size = result.iter().find(|n| n.name == "size").unwrap();
+        assert_eq!(size.node_type, NodeType::Constant);
+
+        let val = size.inputs[0].value().unwrap().scalar_i64().unwrap();
+        assert_eq!(val, 4);
+    }
+
+    #[test]
+    fn test_size_of_shape_folds_without_static_shape() {
+        // The rank of a Shape is known even when the dimension values are not,
+        // so the fold must not depend on static_shape being populated.
+        let dynamic_input = Argument {
+            name: "input".to_string(),
+            ty: ArgType::Tensor(TensorType {
+                dtype: DType::F32,
+                rank: 3,
+                static_shape: None,
+            }),
+            value_source: ValueSource::Dynamic,
+            value_store: None,
+        };
+        let nodes = vec![
+            raw_node(
+                "shape",
+                NodeType::Shape,
+                vec![dynamic_input],
+                vec![shape_arg("shape_out", 3)],
+                Attributes::new(),
+            ),
+            raw_node(
+                "size",
+                NodeType::Size,
+                vec![shape_arg("shape_out", 3)],
+                vec![scalar_arg("size_out", DType::I64)],
+                Attributes::new(),
+            ),
+        ];
+
+        let state = test_state();
+        let result = simplify_constant_shape(nodes, &mut [], &state);
+        let size = result.iter().find(|n| n.name == "size").unwrap();
+        assert_eq!(size.node_type, NodeType::Constant);
+        assert_eq!(size.inputs[0].value().unwrap().scalar_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_size_of_tensor_not_folded() {
+        // Size of a real tensor depends on runtime dimensions, so it stays a Size node.
+        let nodes = vec![raw_node(
+            "size",
+            NodeType::Size,
+            vec![tensor_arg_with_shape("input", vec![2, 6, 2, 3])],
+            vec![scalar_arg("size_out", DType::I64)],
+            Attributes::new(),
+        )];
+
+        let state = test_state();
+        let result = simplify_constant_shape(nodes, &mut [], &state);
+        let size = result.iter().find(|n| n.name == "size").unwrap();
+        assert_eq!(size.node_type, NodeType::Size);
     }
 }

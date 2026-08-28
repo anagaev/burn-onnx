@@ -147,6 +147,7 @@ pub mod sign;
 pub mod simplify;
 pub mod sin;
 pub mod sinh;
+pub mod size;
 pub mod slice;
 pub mod softmax;
 pub mod softplus;
@@ -169,6 +170,7 @@ pub mod topk;
 pub mod transpose;
 pub mod trilu;
 pub mod unsqueeze;
+pub mod upsample;
 pub mod where_op;
 pub mod xor;
 

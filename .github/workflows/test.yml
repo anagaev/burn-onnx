@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: ${{ matrix.toolchain }}
           cache-key: ""
@@ -91,7 +91,7 @@ jobs:
         run: xtask check lint
       # --------------------------------------------------------------------------------
       - name: Typos
-        uses: tracel-ai/github-actions/check-typos@v9
+        uses: tracel-ai/github-actions/check-typos@v11
 
   documentation:
     runs-on: ubuntu-22.04
@@ -107,7 +107,7 @@ jobs:
         uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: ${{ matrix.toolchain }}
           cache-key: ""
@@ -140,7 +140,7 @@ jobs:
         uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: ${{ matrix.toolchain }}
           cache-key: ""
@@ -166,7 +166,7 @@ jobs:
         uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: ${{ matrix.toolchain }}
           cache-key: ""
@@ -193,7 +193,7 @@ jobs:
         uses: actions/checkout@v7
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: ${{ matrix.toolchain }}
           cache-key: ""
@@ -201,6 +201,46 @@ jobs:
       # --------------------------------------------------------------------------------
       - name: Tests
         run: xtask test ${{ env.TEST_RELEASE_FLAG }} -x ${{ env.CI_EXCLUDE }}
+
+  onnx-export-tests:
+    # Export requires burn's graph-capture feature and python for ONNX checks,
+    # so it is opt-in and tested separately from the released import stack.
+    # ort rc.13 downloads ONNX Runtime 1.28 binaries built against glibc 2.38+
+    # and a newer libstdc++; Ubuntu 22.04 only provides glibc 2.35.
+    runs-on: ubuntu-24.04
+    needs: [prepare-checks, code-quality]
+    env:
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v9
+        with:
+          rust-toolchain: stable
+          cache-key: ""
+          shared-key: stable-linux-onnx-export
+      # --------------------------------------------------------------------------------
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-python: true
+      # --------------------------------------------------------------------------------
+      - name: Install ONNX checker
+        run: |
+          uv venv "$RUNNER_TEMP/onnx-venv"
+          uv pip install --python "$RUNNER_TEMP/onnx-venv/bin/python" onnx
+          echo "$RUNNER_TEMP/onnx-venv/bin" >> "$GITHUB_PATH"
+      # --------------------------------------------------------------------------------
+      - name: Export tests
+        env:
+          BURN_ONNX_PYTHON_REQUIRED: '1'
+        run: cargo test -p burn-onnx --no-default-features --features export ${{ env.TEST_RELEASE_FLAG }}
+      # --------------------------------------------------------------------------------
+      - name: Combined import and export check
+        run: cargo check -p burn-onnx --features export
 
   onnx-official-tests:
     # Dedicated regression gate against the upstream ONNX backend test
@@ -234,7 +274,7 @@ jobs:
           fetch-depth: 0
       # --------------------------------------------------------------------------------
       - name: Install Rust
-        uses: tracel-ai/github-actions/install-rust@v9
+        uses: tracel-ai/github-actions/install-rust@v11
         with:
           rust-toolchain: stable
           cache-key: ""

@@ -11,6 +11,8 @@ include_models!(
     slice_shape_runtime_bounds_i32,
     slice_shape_runtime_bounds_negative,
     slice_shape_runtime_bounds_reshape,
+    slice_shape_runtime_bounds_concat,
+    slice_shape_runtime_bounds_concat_reshape,
     slice_shape_multi,
     slice_shape_negative,
     slice_shape_negative_range,
@@ -21,7 +23,11 @@ include_models!(
     slice_axes,
     slice_with_steps,
     slice_shape_with_steps,
-    slice_empty
+    slice_empty,
+    slice_min_sentinel,
+    slice_reverse_dynamic,
+    slice_reverse_steps,
+    slice_shape_reverse
 );
 
 #[cfg(test)]
@@ -239,6 +245,47 @@ mod tests {
     }
 
     #[test]
+    fn slice_shape_runtime_bounds_concat() {
+        // A runtime-bound Shape slice (tensor) concatenated with a
+        // constant-bound one (fixed-size array). Both representations have to
+        // reach Concat as tensors, otherwise the generated code indexes a
+        // tensor like an array (issue #438).
+        let model: slice_shape_runtime_bounds_concat::Model =
+            slice_shape_runtime_bounds_concat::Model::default();
+        let device = Default::default();
+
+        let key = Tensor::<3>::ones([4, 7, 64], &device);
+        let end = Tensor::<1, burn::tensor::Int>::from_data([3i64], &device);
+
+        let output = model.forward(key.clone(), end);
+        let expected = TensorData::from([4i64, 7, 64]);
+        output.to_data().assert_eq(&expected, true);
+
+        // A different bound yields a different length from the same model,
+        // which is the whole point of the tensor representation.
+        let end = Tensor::<1, burn::tensor::Int>::from_data([2i64], &device);
+        let output = model.forward(key, end);
+        let expected = TensorData::from([4i64, 7]);
+        output.to_data().assert_eq(&expected, true);
+    }
+
+    #[test]
+    fn slice_shape_runtime_bounds_concat_reshape() {
+        // The full issue #438 pattern: the concatenated shape drives a Reshape,
+        // so the Concat output type also has to satisfy Reshape's rank
+        // inference, not just compile on its own.
+        let model: slice_shape_runtime_bounds_concat_reshape::Model =
+            slice_shape_runtime_bounds_concat_reshape::Model::default();
+        let device = Default::default();
+
+        let x = Tensor::<3>::ones([4, 7, 64], &device);
+        let end = Tensor::<1, burn::tensor::Int>::from_data([3i64], &device);
+
+        let output = model.forward(x, end);
+        assert_eq!(output.dims(), [4, 7, 64]);
+    }
+
+    #[test]
     fn slice_shape_multi() {
         let model: slice_shape_multi::Model = slice_shape_multi::Model::default();
         let device = Default::default();
@@ -401,7 +448,7 @@ mod tests {
 
         // Verify some values
         let output_data = output.to_data();
-        let values = output_data.to_vec::<f32>().unwrap();
+        let values = output_data.try_into_vec::<f32>().unwrap();
 
         // First element should be from [0, 1, 11] (reversed last dim)
         // [0, 1, 11] -> 0*100 + 1*10 + 11 = 21
@@ -539,5 +586,151 @@ mod tests {
 
         output_0.to_data().assert_eq(&expected_0, true);
         output_1.to_data().assert_eq(&expected_1, true);
+    }
+
+    #[test]
+    fn slice_min_sentinel() {
+        // Regression test for the ONNX INT64_MIN sentinel on `ends`.
+        //
+        // For step < 0, `ends = i64::MIN` means "past the first element", i.e.
+        // reverse all the way to index 0. Codegen used to emit the sentinel
+        // verbatim into the generated slice range.
+        //
+        // axis 0: starts=4, ends=i64::MIN, step=-1 -> full reverse (5 rows)
+        // axis 1: starts=2, ends=0,        step=-1 -> columns 2, 1
+        let model: slice_min_sentinel::Model = slice_min_sentinel::Model::default();
+        let device = Default::default();
+
+        let input = Tensor::<2>::from_floats(
+            [
+                [0., 1., 2.],
+                [3., 4., 5.],
+                [6., 7., 8.],
+                [9., 10., 11.],
+                [12., 13., 14.],
+            ],
+            &device,
+        );
+
+        let output = model.forward(input);
+
+        assert_eq!(output.dims(), [5, 2]);
+
+        let expected = TensorData::from([[14f32, 13.], [11., 10.], [8., 7.], [5., 4.], [2., 1.]]);
+
+        output.to_data().assert_eq(&expected, true);
+    }
+
+    #[test]
+    fn slice_reverse_dynamic() {
+        // Reverse on an axis with no static size: the bounds are resolved from
+        // the tensor's own dims at runtime. Same model run at three lengths to
+        // make sure nothing was baked in at codegen time. The second output
+        // pins the bounded-`ends` branch and a step of -2.
+        let model: slice_reverse_dynamic::Model = slice_reverse_dynamic::Model::default();
+        let device = Default::default();
+
+        let input = Tensor::<2>::from_floats(
+            [[0., 1., 2.], [3., 4., 5.], [6., 7., 8.], [9., 10., 11.]],
+            &device,
+        );
+        let (output, strided) = model.forward(input);
+        let expected =
+            TensorData::from([[9f32, 10., 11.], [6., 7., 8.], [3., 4., 5.], [0., 1., 2.]]);
+        output.to_data().assert_eq(&expected, true);
+        // x[-1:1:-2] over 4 rows -> row 3 only
+        strided
+            .to_data()
+            .assert_eq(&TensorData::from([[9f32, 10., 11.]]), true);
+
+        let shorter = Tensor::<2>::from_floats([[0., 1., 2.], [3., 4., 5.]], &device);
+        let (output, strided) = model.forward(shorter);
+        let expected = TensorData::from([[3f32, 4., 5.], [0., 1., 2.]]);
+        output.to_data().assert_eq(&expected, true);
+        assert_eq!(strided.dims(), [0, 3]);
+
+        // A third size, where the stride does not divide the axis evenly.
+        let longer = Tensor::<1>::from_data(
+            TensorData::from(
+                (0..21)
+                    .map(|v| v as f32)
+                    .collect::<vec::Vec<f32>>()
+                    .as_slice(),
+            ),
+            &device,
+        )
+        .reshape([7, 3]);
+        let (_, strided) = model.forward(longer);
+        // rows 6, 4, 2
+        strided.to_data().assert_eq(
+            &TensorData::from([[18f32, 19., 20.], [12., 13., 14.], [6., 7., 8.]]),
+            true,
+        );
+    }
+
+    #[test]
+    fn slice_reverse_steps() {
+        // Reverse slicing with |step| > 1. Burn anchors a reverse traversal at
+        // the top of the range and walks down, so a range length that is not a
+        // multiple of the step is what would expose a misaligned stride.
+        let model: slice_reverse_steps::Model = slice_reverse_steps::Model::default();
+        let device = Default::default();
+
+        let input = Tensor::<1>::from_data(
+            TensorData::from(
+                (0..48)
+                    .map(|v| v as f32)
+                    .collect::<vec::Vec<f32>>()
+                    .as_slice(),
+            ),
+            &device,
+        )
+        .reshape([8, 6]);
+
+        let (step3, step2, empty) = model.forward(input);
+
+        // x[6::-3] -> rows 6, 3, 0
+        step3.to_data().assert_eq(
+            &TensorData::from([
+                [36f32, 37., 38., 39., 40., 41.],
+                [18., 19., 20., 21., 22., 23.],
+                [0., 1., 2., 3., 4., 5.],
+            ]),
+            true,
+        );
+
+        // x[:, 5:1:-2] -> cols 5, 3
+        step2.to_data().assert_eq(
+            &TensorData::from([
+                [5f32, 3.],
+                [11., 9.],
+                [17., 15.],
+                [23., 21.],
+                [29., 27.],
+                [35., 33.],
+                [41., 39.],
+                [47., 45.],
+            ]),
+            true,
+        );
+
+        // x[0:8:-1] selects nothing under ONNX
+        assert_eq!(empty.dims(), [0, 6]);
+    }
+
+    #[test]
+    fn slice_shape_reverse() {
+        // Reverse slicing a Shape value. The generated code builds a
+        // fixed-size array whose length comes from onnx-ir, so a bounds
+        // disagreement shows up as a panic rather than a wrong value.
+        let model: slice_shape_reverse::Model = slice_shape_reverse::Model::default();
+        let device = Default::default();
+
+        let input = Tensor::<6>::ones([2, 3, 4, 5, 6, 7], &device);
+        let (reversed, strided) = model.forward(input);
+
+        assert_eq!(reversed, [7i64, 6, 5, 4, 3, 2]);
+        // shape[5::-2] -> entries 5, 3, 1
+        assert_eq!(strided, [7i64, 5, 3]);
     }
 }

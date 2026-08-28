@@ -10,11 +10,10 @@ test-wgpu = ["burn/wgpu"]
 test-flex = ["burn/flex"]
 test-tch = ["burn/tch"]
 test-metal = ["burn/metal"]
-test-candle = ["burn/candle"]
 
 [dev-dependencies]
 burn = { workspace = true }
-burn-store = { workspace = true, features = ["std", "burnpack"] }
+burn-store = { workspace = true, features = ["std"] }
 serde = { workspace = true }
 float-cmp = { workspace = true }
 insta = { workspace = true }

@@ -324,6 +324,8 @@ define_node_enum! {
     Pad => pad::PadNode,
     Reshape => reshape::ReshapeNode,
     Resize => resize::ResizeNode,
+    /// Deprecated predecessor of Resize; shares its node and codegen.
+    Upsample => resize::ResizeNode,
     Scatter => unsupported::ScatterNode,
     ScatterElements => scatter_elements::ScatterElementsNode,
     ScatterND => scatter_nd::ScatterNDNode,
@@ -475,7 +477,6 @@ define_node_enum! {
     Swish => swish::SwishNode,
     TensorScatter => unsupported::TensorScatterNode,
     TfIdfVectorizer => unsupported::TfIdfVectorizerNode,
-    Upsample => unsupported::UpsampleNode,
 }
 
 #[cfg(test)]

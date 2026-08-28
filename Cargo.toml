@@ -34,7 +34,7 @@ exclude = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-version = "0.22.0-pre.1"
+version = "0.22.0-pre.3"
 
 [workspace.lints.clippy]
 
@@ -49,10 +49,10 @@ invalid_html_tags = "deny"
 # (Cargo forbids consumers from overriding default-features when inheriting via
 # `workspace = true`); consumers that previously had defaults ON now opt in via
 # `features = ["default"]`.
-burn-import = { path = "crates/burn-import", version = "=0.22.0-pre.1", default-features = false }
-burn-onnx = { path = "crates/burn-onnx", version = "=0.22.0-pre.1", default-features = false }
-onnx-ir = { path = "crates/onnx-ir", version = "=0.22.0-pre.1", default-features = false }
-onnx-ir-derive = { path = "crates/onnx-ir-derive", version = "=0.22.0-pre.1" }
+burn-import = { path = "crates/burn-import", version = "=0.22.0-pre.3", default-features = false }
+burn-onnx = { path = "crates/burn-onnx", version = "=0.22.0-pre.3", default-features = false }
+onnx-ir = { path = "crates/onnx-ir", version = "=0.22.0-pre.3", default-features = false }
+onnx-ir-derive = { path = "crates/onnx-ir-derive", version = "=0.22.0-pre.3" }
 model-checks-common = { path = "crates/model-checks/common" }
 
 bytemuck = "1.25.0"
@@ -86,30 +86,35 @@ serde = { version = "1.0.228", default-features = false, features = [
 ] } # alloc is for no_std, derive is needed
 strum = { version = "0.28.0", features = ["derive"] }
 bytes = { version = "1.11.1", default-features = false }
+hashbrown = "0.17"
 memmap2 = { version = "0.9" }
+ort = "=2.0.0-rc.13"
+tempfile = "3.24.0"
 thiserror = { version = "2", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = ["parse", "serde"] }
 
-# burn = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "78f10aec1ca6c6ffb1edd17a0fa131ae59ad5403" }
-# burn-flex = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "78f10aec1ca6c6ffb1edd17a0fa131ae59ad5403" }
-# burn-store = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "78f10aec1ca6c6ffb1edd17a0fa131ae59ad5403" }
-# burn-tensor = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "78f10aec1ca6c6ffb1edd17a0fa131ae59ad5403" }
+burn = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "4004a44ce9afe48da3cdc1187f51d5035ab8c721" }
+burn-flex = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "4004a44ce9afe48da3cdc1187f51d5035ab8c721" }
+burn-pack = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "4004a44ce9afe48da3cdc1187f51d5035ab8c721" }
+burn-store = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "4004a44ce9afe48da3cdc1187f51d5035ab8c721" }
+burn-tensor = { git = "https://github.com/tracel-ai/burn", default-features = false, rev = "4004a44ce9afe48da3cdc1187f51d5035ab8c721" }
 
 ### For local development. ###
 # burn = { path = "../burn/crates/burn", default-features = false }
 # burn-flex = { path = "../burn/crates/burn-flex", default-features = false }
+# burn-pack = { path = "../burn/crates/burn-pack", default-features = false }
 # burn-store = { path = "../burn/crates/burn-store", default-features = false }
 # burn-tensor = { path = "../burn/crates/burn-tensor", default-features = false }
 
 ### For the release. ###
-burn = { version = "0.22.0-pre.1", default-features = false }
-burn-flex = { version = "0.22.0-pre.1", default-features = false }
-burn-pack = { version = "0.22.0-pre.1", default-features = false }
-burn-store = { version = "0.22.0-pre.1", default-features = false }
-burn-tensor = { version = "0.22.0-pre.1", default-features = false }
+# burn = { version = "=0.22.0-pre.3", default-features = false }
+# burn-flex = { version = "=0.22.0-pre.3", default-features = false }
+# burn-pack = { version = "=0.22.0-pre.3", default-features = false }
+# burn-store = { version = "=0.22.0-pre.3", default-features = false }
+# burn-tensor = { version = "=0.22.0-pre.3", default-features = false }
 
 ### For xtask crate ###
-tracel-xtask = "=4.19.0"
+tracel-xtask = { version = "=5.0.0" }
 # ### For local development. ###
 # tracel-xtask = { path = "../xtask/crates/tracel-xtask", default-features = false }
 

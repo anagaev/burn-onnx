@@ -89,6 +89,7 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/avg_pool2d_ceil_mode/avg_pool2d_ceil_mode.onnx")
         .input("tests/avg_pool/avg_pool1d_asymmetric_padding.onnx")
         .input("tests/avg_pool/avg_pool2d_asymmetric_padding.onnx")
+        .input("tests/avg_pool/avg_pool2d_same_upper_dynamic.onnx")
         .input("tests/lp_pool1d/lp_pool1d.onnx")
         .input("tests/lp_pool2d/lp_pool2d.onnx")
         .input("tests/batch_norm/batch_norm.onnx")
@@ -127,6 +128,7 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/concat/concat.onnx")
         .input("tests/concat/concat_shape.onnx")
         .input("tests/concat/concat_shape_with_constant.onnx")
+        .input("tests/concat/concat_shape_with_tensor.onnx")
         .input("tests/concat/concat_mixed_single_element.onnx")
         .input("tests/concat/concat_mixed_three_elements.onnx")
         .input("tests/concat/concat_multiple_mixed.onnx")
@@ -159,6 +161,8 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/conv3d/conv3d.onnx")
         .input("tests/conv/conv1d_asymmetric_padding.onnx")
         .input("tests/conv/conv2d_asymmetric_padding.onnx")
+        .input("tests/conv/conv1d_same_upper_dynamic.onnx")
+        .input("tests/conv/conv2d_same_upper_dynamic.onnx")
         .input("tests/conv_transpose1d/conv_transpose1d.onnx")
         .input("tests/conv_transpose2d/conv_transpose2d.onnx")
         .input("tests/conv_transpose3d/conv_transpose3d.onnx")
@@ -342,10 +346,14 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/gru/gru_reverse.onnx")
         .input("tests/gru/gru_with_initial_state.onnx")
         .input("tests/gru/gru_bidirectional.onnx")
+        .input("tests/gru/gru_runtime_weights.onnx")
+        .input("tests/gru/gru_bidirectional_runtime_weights.onnx")
+        .input("tests/gru/gru_bidirectional_static_weights.onnx")
         .input("tests/lstm/lstm.onnx")
         .input("tests/lstm/lstm_bidirectional.onnx")
         .input("tests/lstm/lstm_reverse.onnx")
         .input("tests/lstm/lstm_with_initial_state.onnx")
+        .input("tests/lstm/lstm_runtime_weights.onnx")
         .input("tests/log_softmax/log_softmax.onnx")
         .input("tests/where_op/where_op.onnx")
         .input("tests/where_op/where_op_broadcast.onnx")
@@ -379,6 +387,7 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/maxpool2d_ceil_mode/maxpool2d_ceil_mode.onnx")
         .input("tests/maxpool/maxpool1d_asymmetric_padding.onnx")
         .input("tests/maxpool/maxpool2d_asymmetric_padding.onnx")
+        .input("tests/maxpool/maxpool2d_same_upper_dynamic.onnx")
         .input("tests/min/min.onnx")
         .input("tests/min/min_broadcast.onnx")
         .input("tests/mish/mish.onnx")
@@ -452,6 +461,7 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/reduce/reduce_l2.onnx")
         .input("tests/reduce/reduce_log_sum.onnx")
         .input("tests/reduce/reduce_log_sum_exp.onnx")
+        .input("tests/reduce/reduce_runtime_axes.onnx")
         .input("tests/relu/relu.onnx")
         .input("tests/reshape/reshape.onnx")
         .input("tests/reshape/reshape_with_1d_tensor.onnx")
@@ -472,10 +482,14 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/resize/resize_with_shape.onnx")
         .input("tests/resize/resize_with_sizes_tensor.onnx")
         .input("tests/resize/resize_with_scales_tensor.onnx")
+        .input("tests/upsample/upsample_nearest_opset7.onnx")
+        .input("tests/upsample/upsample_nearest_opset9.onnx")
+        .input("tests/upsample/upsample_nearest_runtime_scales.onnx")
         .input("tests/rnn/rnn.onnx")
         .input("tests/rnn/rnn_bidirectional.onnx")
         .input("tests/rnn/rnn_reverse.onnx")
         .input("tests/rnn/rnn_with_initial_state.onnx")
+        .input("tests/rnn/rnn_runtime_weights.onnx")
         .input("tests/round/round.onnx")
         .input("tests/scaler/scaler.onnx")
         .input("tests/scaler/scaler_per_feature_3d.onnx")
@@ -491,6 +505,7 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/sin/sin.onnx")
         .input("tests/sinh/sinh.onnx")
         .input("tests/size/size.onnx")
+        .input("tests/size/size_shape.onnx")
         .input("tests/slice/slice.onnx")
         .input("tests/slice/slice_shape.onnx")
         .input("tests/slice/slice_scalar.onnx")
@@ -501,6 +516,8 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/slice/slice_shape_runtime_bounds_i32.onnx")
         .input("tests/slice/slice_shape_runtime_bounds_negative.onnx")
         .input("tests/slice/slice_shape_runtime_bounds_reshape.onnx")
+        .input("tests/slice/slice_shape_runtime_bounds_concat.onnx")
+        .input("tests/slice/slice_shape_runtime_bounds_concat_reshape.onnx")
         .input("tests/slice/slice_shape_multi.onnx")
         .input("tests/slice/slice_shape_negative.onnx")
         .input("tests/slice/slice_shape_negative_range.onnx")
@@ -512,6 +529,10 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/slice/slice_with_steps.onnx")
         .input("tests/slice/slice_shape_with_steps.onnx")
         .input("tests/slice/slice_empty.onnx")
+        .input("tests/slice/slice_min_sentinel.onnx")
+        .input("tests/slice/slice_reverse_dynamic.onnx")
+        .input("tests/slice/slice_reverse_steps.onnx")
+        .input("tests/slice/slice_shape_reverse.onnx")
         .input("tests/selu/selu.onnx")
         .input("tests/softmax/softmax.onnx")
         .input("tests/softplus/softplus.onnx")
@@ -577,6 +598,10 @@ fn add_all_inputs(model_gen: &mut ModelGen) {
         .input("tests/scatter_elements/scatter_elements_mul.onnx")
         .input("tests/scatter_elements/scatter_elements_max.onnx")
         .input("tests/scatter_elements/scatter_elements_min.onnx")
+        .input("tests/scatter_elements/scatter_elements_bool.onnx")
+        .input("tests/scatter_elements/scatter_elements_3d.onnx")
+        .input("tests/scatter_elements/scatter_elements_1d.onnx")
+        .input("tests/scatter_elements/scatter_elements_int.onnx")
         // ScatterND operator tests
         .input("tests/scatter_nd/scatter_nd.onnx")
         .input("tests/scatter_nd/scatter_nd_2d.onnx")
@@ -685,7 +710,7 @@ impl CustomOp for AddWindowOp {
             .ok_or_else(|| {
                 ProcessError::Custom("AddWindow requires a constant window input".to_string())
             })?;
-        window.to_vec::<f32>().map_err(|_| {
+        window.try_into_vec::<f32>().map_err(|_| {
             ProcessError::Custom("AddWindow window constant must be f32".to_string())
         })?;
         Ok(vec![input.ty.clone()])
@@ -701,7 +726,7 @@ impl CustomOp for AddWindowOp {
         let window = node.inputs[1]
             .value()
             .ok_or_else(|| ProcessError::Custom("window constant missing".to_string()))?
-            .to_vec::<f32>()
+            .try_into_vec::<f32>()
             .map_err(|_| ProcessError::Custom("window constant must be f32".to_string()))?;
         Ok(quote! {
             let #out = crate::custom_ops::ops::add_window(#input, &[#(#window),*], &self.device);
@@ -785,5 +810,6 @@ fn add_simplify_inputs(model_gen: &mut ModelGen) {
         .input("tests/simplify/simplify_gather_shape_chain.onnx")
         .input("tests/simplify/simplify_permute_via_shape_gather.onnx")
         .input("tests/simplify/simplify_sdpa_coalesce.onnx")
+        .input("tests/simplify/simplify_sdpa_prescale_alias.onnx")
         .input("tests/simplify/simplify_constant_fold.onnx");
 }

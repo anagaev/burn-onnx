@@ -14,6 +14,7 @@
 use crate::ir::{ArgType, Argument, Node, RawNode, TensorType};
 use crate::processor::{
     InputSpec, NodeProcessor, NodeSpec, OutputPreferences, OutputSpec, ProcessError,
+    lift_all_or_none, validate_uniform_group,
 };
 use derive_new::new;
 use onnx_ir_derive::NodeBuilder;
@@ -174,17 +175,10 @@ impl NodeProcessor for GruProcessor {
     }
 
     fn lift_constants(&self, node: &mut RawNode, _opset: usize) -> Result<(), ProcessError> {
-        // W (weights) and R (recurrence weights) are typically constants
-        if node.inputs.len() > 1 && node.inputs[1].is_constant() {
-            node.inputs[1].to_static()?;
-        }
-        if node.inputs.len() > 2 && node.inputs[2].is_constant() {
-            node.inputs[2].to_static()?;
-        }
-        // B (bias) is optional but typically constant
-        if node.inputs.len() > 3 && node.inputs[3].is_constant() {
-            node.inputs[3].to_static()?;
-        }
+        // W, R and the optional B are lifted together or not at all: a partly lifted
+        // group would leave one weight named and another with its name cleared by
+        // `to_static`, which downstream code cannot consume as a unit.
+        lift_all_or_none(node, &[1, 2, 3])?;
         Ok(())
     }
 
@@ -212,6 +206,10 @@ impl NodeProcessor for GruProcessor {
                 input_tensor.rank
             )));
         }
+
+        // W, R and the optional B are consumed as one group, either all from the graph's
+        // initializers or all from its inputs.
+        validate_uniform_group(node, &[1, 2, 3], &[1, 2])?;
 
         // Validate weight tensor (W)
         let weight_tensor = match &node.inputs[1].ty {
@@ -600,5 +598,71 @@ mod tests {
 
         assert_eq!(spec.min_opset, 1);
         assert!(spec.max_opset.is_none());
+    }
+
+    #[test]
+    fn lift_constants_is_all_or_nothing() {
+        // A constant W alongside a runtime R must stay unlifted: burn-onnx's
+        // runtime-weight path references every weight by name, and `to_static`
+        // clears the name.
+        let mut node = TestNodeBuilder::new(NodeType::Gru, "test_gru")
+            .input_tensor_f32("X", 3, Some(vec![10, 2, 4]))
+            .input_tensor_f32_data("W", vec![0.0; 15 * 4], vec![1, 15, 4])
+            .input_tensor_f32("R", 3, Some(vec![1, 15, 5]))
+            .attr_int("hidden_size", 5)
+            .output_tensor_f32("Y", 4, None)
+            .build_with_graph_data(14);
+
+        GruProcessor.lift_constants(&mut node, 14).unwrap();
+
+        assert!(
+            node.inputs[1].is_constant(),
+            "W must stay named while R is a graph input"
+        );
+        assert!(node.inputs[2].is_dynamic());
+    }
+
+    #[test]
+    fn lift_constants_lifts_when_every_weight_is_constant() {
+        let mut node = create_gru_node(8, None, None, 2);
+
+        GruProcessor.lift_constants(&mut node, 14).unwrap();
+
+        assert!(node.inputs[1].value().is_some());
+        assert!(node.inputs[2].value().is_some());
+    }
+
+    #[test]
+    fn mixed_build_time_and_runtime_weights_are_rejected() {
+        // A subgraph capturing an already-lifted outer W alongside a body-input R lands
+        // here. Codegen consumes the group as a unit, so it has nowhere to put a mixture.
+        let mut node = create_gru_node(8, None, None, 2);
+        node.inputs[2].value_source = crate::ir::ValueSource::Dynamic;
+        GruProcessor.lift_constants(&mut node, 14).unwrap();
+
+        let err = GruProcessor
+            .infer_types(&mut node, 14, &OutputPreferences::default())
+            .expect_err("a mixed weight group must be rejected");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("both be initializers or both be graph inputs"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn an_omitted_required_weight_is_rejected() {
+        let mut node = create_gru_node(8, None, None, 2);
+        node.inputs[1].value_source = crate::ir::ValueSource::Optional;
+
+        let err = GruProcessor
+            .infer_types(&mut node, 14, &OutputPreferences::default())
+            .expect_err("W is required");
+
+        assert!(
+            format!("{err}").contains("required but was not provided"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -1,10 +1,12 @@
 #[macro_use]
 extern crate log;
 
+mod check;
 mod diff_expectations;
 mod expectations_schema;
 mod model_check;
 mod refresh_onnx_tests;
+mod retriage;
 mod update_expectations;
 
 use std::time::Instant;
@@ -15,19 +17,18 @@ const WASM32_TARGET: &str = "wasm32-unknown-unknown";
 const ARM_TARGET: &str = "thumbv7m-none-eabi";
 const ARM_NO_ATOMIC_PTR_TARGET: &str = "thumbv6m-none-eabi";
 
-#[macros::base_commands(
-    Bump,
-    Check,
-    Compile,
-    Coverage,
-    Doc,
-    Dependencies,
-    Fix,
-    Publish,
-    Validate,
-    Vulnerabilities
-)]
+#[derive(clap::Subcommand, strum::Display)]
 pub enum Command {
+    Bump(BumpCmdArgs),
+    Check(CheckCmdArgs),
+    Compile(CompileCmdArgs),
+    Coverage(CoverageCmdArgs),
+    Dependencies(DependenciesCmdArgs),
+    Doc(DocCmdArgs),
+    Fix(FixCmdArgs),
+    Publish(PublishCmdArgs),
+    Validate(ValidateCmdArgs),
+    Vulnerabilities(VulnerabilitiesCmdArgs),
     /// Build Burn ONNX in different modes.
     Build(BuildCmdArgs),
     /// Test Burn ONNX.
@@ -47,6 +48,31 @@ pub enum Command {
     /// `expectations.toml` in place to demote any pass-listed tests
     /// that now fail. Supports `--dry-run` for preview mode.
     UpdateExpectations(update_expectations::UpdateExpectationsArgs),
+    /// Re-run the `skip-codegen` and `skip-compile` rows of
+    /// `expectations.toml` against the current tree and rewrite them to
+    /// match reality. Those rows are never exercised by the build, so
+    /// they go stale as the bugs behind them get fixed.
+    Retriage(retriage::RetriageArgs),
+}
+
+fn dispatch_base_commands(args: XtaskArgs<Command>, env: Environment) -> anyhow::Result<()> {
+    match args.command {
+        Command::Bump(cmd) => base_commands::bump::handle_command(cmd, env, args.context),
+        Command::Check(cmd) => base_commands::check::handle_command(cmd, env, args.context),
+        Command::Compile(cmd) => base_commands::compile::handle_command(cmd, env, args.context),
+        Command::Coverage(cmd) => base_commands::coverage::handle_command(cmd, env, args.context),
+        Command::Dependencies(cmd) => {
+            base_commands::dependencies::handle_command(cmd, env, args.context)
+        }
+        Command::Doc(cmd) => base_commands::doc::handle_command(cmd, env, args.context),
+        Command::Fix(cmd) => base_commands::fix::handle_command(cmd, env, args.context, None),
+        Command::Publish(cmd) => base_commands::publish::handle_command(cmd, env, args.context),
+        Command::Validate(cmd) => base_commands::validate::handle_command(cmd, env, args.context),
+        Command::Vulnerabilities(cmd) => {
+            base_commands::vulnerabilities::handle_command(cmd, env, args.context)
+        }
+        _ => Err(anyhow::anyhow!("Unknown command")),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,6 +87,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     match args.command {
+        Command::Check(cmd_args) => check::handle_command(cmd_args, environment, args.context),
         Command::Build(cmd_args) => {
             base_commands::build::handle_command(cmd_args, environment, args.context)
         }
@@ -71,6 +98,7 @@ fn main() -> anyhow::Result<()> {
         Command::RefreshOnnxTests(cmd_args) => refresh_onnx_tests::handle_command(cmd_args),
         Command::DiffExpectations(cmd_args) => diff_expectations::handle_command(cmd_args),
         Command::UpdateExpectations(cmd_args) => update_expectations::handle_command(cmd_args),
+        Command::Retriage(cmd_args) => retriage::handle_command(cmd_args),
         _ => dispatch_base_commands(args, environment),
     }?;
 
