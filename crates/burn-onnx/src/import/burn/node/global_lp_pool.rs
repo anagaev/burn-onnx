@@ -14,23 +14,17 @@ impl NodeCodegen for onnx_ir::global_lp_pool::GlobalLpPoolNode {
         let output = arg_to_ident(self.outputs.first().unwrap());
         let p = self.config.p;
         let inv_p = 1.0f64 / p as f64;
-        // Determine the input rank from the type info
         let rank = match &self.inputs[0].ty {
             ArgType::Tensor(t) => t.rank,
-            _ => panic!("GlobalLpPool input must be a tensor"),
+            _ => {
+                let msg = format!("GlobalLpPool node '{}': input must be a tensor", self.name);
+                return quote! { let #output = { compile_error!(#msg); unreachable!() }; };
+            }
         };
 
-        // Build the reshape dimensions: [1, C, 1, 1, ...] for broadcasting
-        // scale/bias/mean/var are 1D tensors of shape [C], need to broadcast
-        // to match input shape [N, C, D1, D2, ...]
-        let dims: Vec<isize> = {
-            // For rank-D input, unsqueeze dim 0 and dims 2..rank-1
-            let mut dims = vec![]; // prepend batch dim
-            for i in 2..rank {
-                dims.push(i as isize);
-            }
-            dims
-        };
+        // Reduce over every spatial axis (2..rank), keeping each as size 1 so the
+        // output is [N, C, 1, 1, ...] as the ONNX spec requires.
+        let dims: Vec<isize> = (2..rank).map(|i| i as isize).collect();
         let mut body = quote! {let x = #input.abs();};
         match p {
             1 => {
@@ -97,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn global_lp_pool_rank3_l3() {
+    fn global_lp_pool_rank3_l4() {
         let node = GlobalLpPoolNodeBuilder::new("global_lp_pool")
             .input_tensor("input", 3, DType::F32)
             .output_tensor("output", 3, DType::F32)
@@ -172,5 +166,24 @@ mod tests {
             output
         }
         ");
+    }
+
+    #[test]
+    fn global_lp_pool_non_tensor_input_emits_compile_error() {
+        let node = GlobalLpPoolNodeBuilder::new("global_lp_pool")
+            .input_scalar("input", DType::F32)
+            .output_tensor("output", 3, DType::F32)
+            .config(GlobalLpPoolConfig::new(2))
+            .build();
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r#"
+        pub fn forward(&self, input: f32) -> Tensor<3> {
+            let output = {
+                compile_error!("GlobalLpPool node 'global_lp_pool': input must be a tensor");
+                unreachable!()
+            };
+            output
+        }
+        "#);
     }
 }
