@@ -12,126 +12,143 @@ impl NodeCodegen for onnx_ir::scatter_elements::ScatterElementsNode {
     }
 
     fn forward(&self, scope: &mut ScopeAtPosition<'_>) -> TokenStream {
-        let dim = self.config.axis.to_tokens();
+        let axis = self.config.axis.to_tokens();
         let data = scope.arg(self.inputs.first().unwrap());
         let indices = scope.arg(&self.inputs[1]);
         let updates = scope.arg(&self.inputs[2]);
         let output = arg_to_ident(self.outputs.first().unwrap());
 
         let data_arg = self.inputs.first().unwrap();
-        let data_kind = match &data_arg.ty {
-            ArgType::Tensor(t) => TensorKind::from(t.dtype),
-            _ => panic!("Expected tensor input for data"),
+        let (data_kind, rank) = match &data_arg.ty {
+            ArgType::Tensor(t) => (TensorKind::from(t.dtype), t.rank),
+            _ => {
+                let msg = format!(
+                    "ScatterElements node '{}': data input must be a tensor",
+                    self.name
+                );
+                return quote! { let #output = { compile_error!(#msg); unreachable!() }; };
+            }
         };
+        let rank_lit = rank.to_tokens();
 
         if matches!(data_kind, TensorKind::Bool)
             && !matches!(self.config.reduction, ScatterElementsReduction::None)
         {
-            panic!(
-                "ScatterElements with {:?} reduction not supported for bool tensors",
-                self.config.reduction
+            let msg = format!(
+                "ScatterElements node '{}': {:?} reduction is not supported for bool tensors",
+                self.name, self.config.reduction
             );
+            return quote! { let #output = { compile_error!(#msg); unreachable!() }; };
         }
 
-        match self.config.reduction {
-            // Native scatter for Add reduction
-            ScatterElementsReduction::Add => quote! {
-                let #output = #data.scatter(#dim, #indices, #updates, burn::tensor::IndexingUpdateOp::Add);
-            },
+        let update_op = match &self.config.reduction {
+            ScatterElementsReduction::None => quote! { burn::tensor::IndexingUpdateOp::Assign },
+            ScatterElementsReduction::Add => quote! { burn::tensor::IndexingUpdateOp::Add },
+            ScatterElementsReduction::Mul => quote! { burn::tensor::IndexingUpdateOp::Mul },
+            ScatterElementsReduction::Max => quote! { burn::tensor::IndexingUpdateOp::Max },
+            ScatterElementsReduction::Min => quote! { burn::tensor::IndexingUpdateOp::Min },
+        };
 
-            // For None with numeric types: gather current values, scatter-add the diff
-            // At targets: data[p] + (updates[p] - data[p]) = updates[p]
-            // Elsewhere: unchanged
-            ScatterElementsReduction::None if !matches!(data_kind, TensorKind::Bool) => quote! {
+        // ONNX allows indices down to `-dim_size` along the scatter axis, which burn's
+        // indexing does not accept, so fold negatives before scattering. Indices outside
+        // `[-dim_size, dim_size - 1]` are an error per the ONNX spec and stay unchecked
+        // here; adding a guard would mean reading the indices back to the host on every
+        // forward pass.
+        let prologue = quote! {
+            let __se_data = #data;
+            let __se_axis_size = __se_data.dims()[#axis] as i64;
+            let __se_indices = #indices.cast(burn::tensor::DType::I64);
+            let __se_negative = __se_indices.clone().lower_elem(0i64);
+            let __se_corrected = __se_indices.clone() + __se_axis_size;
+            let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+        };
+
+        // Add is the only update op burn implements for element-wise `scatter` on every
+        // backend, and the only reduction ONNX and burn both define for duplicate indices.
+        // Staying on it keeps the common case off the coordinate-building path below.
+        if matches!(self.config.reduction, ScatterElementsReduction::Add) {
+            return quote! {
                 let #output = {
-                    let gathered = #data.clone().gather(#dim, #indices.clone());
-                    #data.scatter(#dim, #indices, #updates - gathered, burn::tensor::IndexingUpdateOp::Add)
+                    #prologue
+                    __se_data.scatter(#axis, __se_indices, #updates, #update_op)
                 };
-            },
+            };
+        }
 
-            // Bool None and Mul/Max/Min need element-by-element loop
-            _ => {
-                let reduction_body = match self.config.reduction {
-                    ScatterElementsReduction::None => quote! {
-                        output_flat = output_flat.slice_assign(
-                            [target_offset..target_offset + 1],
-                            update_val,
-                        );
-                    },
-                    ScatterElementsReduction::Mul => quote! {
-                        let existing = output_flat.clone().narrow(0, target_offset, 1);
-                        output_flat = output_flat.slice_assign(
-                            [target_offset..target_offset + 1],
-                            existing.mul(update_val),
-                        );
-                    },
-                    ScatterElementsReduction::Max => quote! {
-                        let existing = output_flat.clone().narrow(0, target_offset, 1);
-                        let mask = update_val.clone().greater_equal(existing.clone());
-                        let result = existing.mask_where(mask, update_val);
-                        output_flat = output_flat.slice_assign(
-                            [target_offset..target_offset + 1],
-                            result,
-                        );
-                    },
-                    ScatterElementsReduction::Min => quote! {
-                        let existing = output_flat.clone().narrow(0, target_offset, 1);
-                        let mask = update_val.clone().lower_equal(existing.clone());
-                        let result = existing.mask_where(mask, update_val);
-                        output_flat = output_flat.slice_assign(
-                            [target_offset..target_offset + 1],
-                            result,
-                        );
-                    },
-                    ScatterElementsReduction::Add => unreachable!(),
-                };
-
-                quote! {
-                    let #output = {
-                        let data_dims = #data.dims();
-                        let updates_dims = #updates.dims();
-                        let indices_data = #indices.to_data().convert::<i64>();
-                        let indices_values: alloc::vec::Vec<i64> = indices_data.into_vec::<i64>().unwrap();
-                        let r = data_dims.len();
-                        let dim: usize = #dim;
-
-                        let mut data_strides = alloc::vec![1usize; r];
-                        for i in (0..r.saturating_sub(1)).rev() {
-                            data_strides[i] = data_strides[i + 1] * data_dims[i + 1];
-                        }
-                        let mut idx_strides = alloc::vec![1usize; r];
-                        for i in (0..r.saturating_sub(1)).rev() {
-                            idx_strides[i] = idx_strides[i + 1] * updates_dims[i + 1];
-                        }
-
-                        let total_data: usize = data_dims.iter().product();
-                        let total_updates: usize = updates_dims.iter().product();
-                        let mut output_flat = #data.reshape([total_data]);
-                        let updates_flat = #updates.reshape([total_updates]);
-
-                        for flat_idx in 0..total_updates {
-                            let mut remaining = flat_idx;
-                            let mut target_offset = 0usize;
-                            for d in 0..r {
-                                let coord = remaining / idx_strides[d];
-                                remaining %= idx_strides[d];
-                                if d == dim {
-                                    let dim_size = data_dims[d] as i64;
-                                    let mut idx = indices_values[flat_idx];
-                                    if idx < 0 { idx += dim_size; }
-                                    assert!(idx >= 0 && idx < dim_size, "ScatterElements: index out of bounds");
-                                    target_offset += idx as usize * data_strides[d];
-                                } else {
-                                    target_offset += coord * data_strides[d];
-                                }
-                            }
-                            let update_val = updates_flat.clone().narrow(0, flat_idx, 1);
-                            #reduction_body
-                        }
-                        output_flat.reshape(data_dims)
-                    };
+        // No backend implements Min or Max for element-wise `scatter`; Assign is ndarray
+        // only and Mul is ndarray and flex, while cubecl and tch inherit the Add-only
+        // default body (tracel-ai/burn#5522). Every numeric backend does implement all
+        // five for `scatter_nd`. ScatterElements assigns
+        //   output[p_0, .., p_{axis-1}, indices[p], p_{axis+1}, .., p_{r-1}] = updates[p]
+        // for every p in the index shape, so materializing those coordinates as index
+        // tuples turns it into a ScatterND. The non-axis columns are the row-major
+        // coordinates of p, recovered from a flat arange.
+        //
+        // Duplicate indices fold sequentially on the CPU backends but race on cubecl,
+        // which burn documents as undefined for Assign, Mul, Min and Max.
+        let strides = if rank > 1 {
+            quote! {
+                let mut __se_strides = [1usize; #rank_lit];
+                for __se_d in (0..#rank_lit - 1).rev() {
+                    __se_strides[__se_d] = __se_strides[__se_d + 1] * __se_idx_dims[__se_d + 1];
                 }
             }
+        } else {
+            quote! { let __se_strides = [1usize; #rank_lit]; }
+        };
+
+        let coordinates = quote! {
+            #strides
+            let __se_flat = Tensor::<1, Int>::arange(
+                0..__se_n as i64,
+                (&self.device, burn::tensor::DType::I64),
+            );
+            let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> =
+                alloc::vec::Vec::with_capacity(#rank_lit);
+            for __se_d in 0..#rank_lit {
+                __se_columns.push(if __se_d == #axis {
+                    __se_indices.clone().reshape([__se_n, 1])
+                } else {
+                    __se_flat
+                        .clone()
+                        .div_scalar(__se_strides[__se_d] as i64)
+                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                        .reshape([__se_n, 1])
+                });
+            }
+            let __se_coordinates = Tensor::cat(__se_columns, 1);
+        };
+
+        // An empty index tensor is a legal ONNX no-op, but `scatter_nd` rejects empty
+        // indices and `reshape([0, ..])` would read the 0 as "keep the source dim".
+        let scatter = if matches!(data_kind, TensorKind::Bool) {
+            // `scatter_nd` panics for bool tensors, so round-trip through i64.
+            quote! {
+                let __se_updates = #updates.int().cast(burn::tensor::DType::I64);
+                __se_data
+                    .int()
+                    .cast(burn::tensor::DType::I64)
+                    .scatter_nd(__se_coordinates, __se_updates.reshape([__se_n]), #update_op)
+                    .bool()
+            }
+        } else {
+            quote! {
+                __se_data.scatter_nd(__se_coordinates, #updates.reshape([__se_n]), #update_op)
+            }
+        };
+
+        quote! {
+            let #output = {
+                #prologue
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    #coordinates
+                    #scatter
+                }
+            };
         }
     }
 }
@@ -164,8 +181,51 @@ mod tests {
             updates: Tensor<2>,
         ) -> Tensor<2> {
             let output = {
-                let gathered = data.clone().gather(0, indices.clone());
-                data.scatter(0, indices, updates - gathered, burn::tensor::IndexingUpdateOp::Add)
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let mut __se_strides = [1usize; 2];
+                    for __se_d in (0..2 - 1).rev() {
+                        __se_strides[__se_d] = __se_strides[__se_d + 1]
+                            * __se_idx_dims[__se_d + 1];
+                    }
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        2,
+                    );
+                    for __se_d in 0..2 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
+                            );
+                    }
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    __se_data
+                        .scatter_nd(
+                            __se_coordinates,
+                            updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Assign,
+                        )
+                }
             };
             output
         }
@@ -190,7 +250,15 @@ mod tests {
             indices: Tensor<2, Int>,
             updates: Tensor<2>,
         ) -> Tensor<2> {
-            let output = data.scatter(1, indices, updates, burn::tensor::IndexingUpdateOp::Add);
+            let output = {
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[1] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                __se_data.scatter(1, __se_indices, updates, burn::tensor::IndexingUpdateOp::Add)
+            };
             output
         }
         ");
@@ -207,7 +275,7 @@ mod tests {
             .config(config)
             .build();
         let code = codegen_forward_default(&node);
-        assert_snapshot!(code, @r#"
+        assert_snapshot!(code, @r"
         pub fn forward(
             &self,
             data: Tensor<2>,
@@ -215,60 +283,55 @@ mod tests {
             updates: Tensor<2>,
         ) -> Tensor<2> {
             let output = {
-                let data_dims = data.dims();
-                let updates_dims = updates.dims();
-                let indices_data = indices.to_data().convert::<i64>();
-                let indices_values: alloc::vec::Vec<i64> = indices_data
-                    .into_vec::<i64>()
-                    .unwrap();
-                let r = data_dims.len();
-                let dim: usize = 0;
-                let mut data_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    data_strides[i] = data_strides[i + 1] * data_dims[i + 1];
-                }
-                let mut idx_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    idx_strides[i] = idx_strides[i + 1] * updates_dims[i + 1];
-                }
-                let total_data: usize = data_dims.iter().product();
-                let total_updates: usize = updates_dims.iter().product();
-                let mut output_flat = data.reshape([total_data]);
-                let updates_flat = updates.reshape([total_updates]);
-                for flat_idx in 0..total_updates {
-                    let mut remaining = flat_idx;
-                    let mut target_offset = 0usize;
-                    for d in 0..r {
-                        let coord = remaining / idx_strides[d];
-                        remaining %= idx_strides[d];
-                        if d == dim {
-                            let dim_size = data_dims[d] as i64;
-                            let mut idx = indices_values[flat_idx];
-                            if idx < 0 {
-                                idx += dim_size;
-                            }
-                            assert!(
-                                idx >= 0 && idx < dim_size,
-                                "ScatterElements: index out of bounds"
-                            );
-                            target_offset += idx as usize * data_strides[d];
-                        } else {
-                            target_offset += coord * data_strides[d];
-                        }
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let mut __se_strides = [1usize; 2];
+                    for __se_d in (0..2 - 1).rev() {
+                        __se_strides[__se_d] = __se_strides[__se_d + 1]
+                            * __se_idx_dims[__se_d + 1];
                     }
-                    let update_val = updates_flat.clone().narrow(0, flat_idx, 1);
-                    let existing = output_flat.clone().narrow(0, target_offset, 1);
-                    output_flat = output_flat
-                        .slice_assign(
-                            [target_offset..target_offset + 1],
-                            existing.mul(update_val),
-                        );
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        2,
+                    );
+                    for __se_d in 0..2 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
+                            );
+                    }
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    __se_data
+                        .scatter_nd(
+                            __se_coordinates,
+                            updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Mul,
+                        )
                 }
-                output_flat.reshape(data_dims)
             };
             output
         }
-        "#);
+        ");
     }
 
     #[test]
@@ -282,7 +345,7 @@ mod tests {
             .config(config)
             .build();
         let code = codegen_forward_default(&node);
-        assert_snapshot!(code, @r#"
+        assert_snapshot!(code, @r"
         pub fn forward(
             &self,
             data: Tensor<2>,
@@ -290,59 +353,55 @@ mod tests {
             updates: Tensor<2>,
         ) -> Tensor<2> {
             let output = {
-                let data_dims = data.dims();
-                let updates_dims = updates.dims();
-                let indices_data = indices.to_data().convert::<i64>();
-                let indices_values: alloc::vec::Vec<i64> = indices_data
-                    .into_vec::<i64>()
-                    .unwrap();
-                let r = data_dims.len();
-                let dim: usize = 0;
-                let mut data_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    data_strides[i] = data_strides[i + 1] * data_dims[i + 1];
-                }
-                let mut idx_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    idx_strides[i] = idx_strides[i + 1] * updates_dims[i + 1];
-                }
-                let total_data: usize = data_dims.iter().product();
-                let total_updates: usize = updates_dims.iter().product();
-                let mut output_flat = data.reshape([total_data]);
-                let updates_flat = updates.reshape([total_updates]);
-                for flat_idx in 0..total_updates {
-                    let mut remaining = flat_idx;
-                    let mut target_offset = 0usize;
-                    for d in 0..r {
-                        let coord = remaining / idx_strides[d];
-                        remaining %= idx_strides[d];
-                        if d == dim {
-                            let dim_size = data_dims[d] as i64;
-                            let mut idx = indices_values[flat_idx];
-                            if idx < 0 {
-                                idx += dim_size;
-                            }
-                            assert!(
-                                idx >= 0 && idx < dim_size,
-                                "ScatterElements: index out of bounds"
-                            );
-                            target_offset += idx as usize * data_strides[d];
-                        } else {
-                            target_offset += coord * data_strides[d];
-                        }
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let mut __se_strides = [1usize; 2];
+                    for __se_d in (0..2 - 1).rev() {
+                        __se_strides[__se_d] = __se_strides[__se_d + 1]
+                            * __se_idx_dims[__se_d + 1];
                     }
-                    let update_val = updates_flat.clone().narrow(0, flat_idx, 1);
-                    let existing = output_flat.clone().narrow(0, target_offset, 1);
-                    let mask = update_val.clone().greater_equal(existing.clone());
-                    let result = existing.mask_where(mask, update_val);
-                    output_flat = output_flat
-                        .slice_assign([target_offset..target_offset + 1], result);
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        2,
+                    );
+                    for __se_d in 0..2 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
+                            );
+                    }
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    __se_data
+                        .scatter_nd(
+                            __se_coordinates,
+                            updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Max,
+                        )
                 }
-                output_flat.reshape(data_dims)
             };
             output
         }
-        "#);
+        ");
     }
 
     #[test]
@@ -356,7 +415,7 @@ mod tests {
             .config(config)
             .build();
         let code = codegen_forward_default(&node);
-        assert_snapshot!(code, @r#"
+        assert_snapshot!(code, @r"
         pub fn forward(
             &self,
             data: Tensor<2>,
@@ -364,59 +423,55 @@ mod tests {
             updates: Tensor<2>,
         ) -> Tensor<2> {
             let output = {
-                let data_dims = data.dims();
-                let updates_dims = updates.dims();
-                let indices_data = indices.to_data().convert::<i64>();
-                let indices_values: alloc::vec::Vec<i64> = indices_data
-                    .into_vec::<i64>()
-                    .unwrap();
-                let r = data_dims.len();
-                let dim: usize = 0;
-                let mut data_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    data_strides[i] = data_strides[i + 1] * data_dims[i + 1];
-                }
-                let mut idx_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    idx_strides[i] = idx_strides[i + 1] * updates_dims[i + 1];
-                }
-                let total_data: usize = data_dims.iter().product();
-                let total_updates: usize = updates_dims.iter().product();
-                let mut output_flat = data.reshape([total_data]);
-                let updates_flat = updates.reshape([total_updates]);
-                for flat_idx in 0..total_updates {
-                    let mut remaining = flat_idx;
-                    let mut target_offset = 0usize;
-                    for d in 0..r {
-                        let coord = remaining / idx_strides[d];
-                        remaining %= idx_strides[d];
-                        if d == dim {
-                            let dim_size = data_dims[d] as i64;
-                            let mut idx = indices_values[flat_idx];
-                            if idx < 0 {
-                                idx += dim_size;
-                            }
-                            assert!(
-                                idx >= 0 && idx < dim_size,
-                                "ScatterElements: index out of bounds"
-                            );
-                            target_offset += idx as usize * data_strides[d];
-                        } else {
-                            target_offset += coord * data_strides[d];
-                        }
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let mut __se_strides = [1usize; 2];
+                    for __se_d in (0..2 - 1).rev() {
+                        __se_strides[__se_d] = __se_strides[__se_d + 1]
+                            * __se_idx_dims[__se_d + 1];
                     }
-                    let update_val = updates_flat.clone().narrow(0, flat_idx, 1);
-                    let existing = output_flat.clone().narrow(0, target_offset, 1);
-                    let mask = update_val.clone().lower_equal(existing.clone());
-                    let result = existing.mask_where(mask, update_val);
-                    output_flat = output_flat
-                        .slice_assign([target_offset..target_offset + 1], result);
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        2,
+                    );
+                    for __se_d in 0..2 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
+                            );
+                    }
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    __se_data
+                        .scatter_nd(
+                            __se_coordinates,
+                            updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Min,
+                        )
                 }
-                output_flat.reshape(data_dims)
             };
             output
         }
-        "#);
+        ");
     }
 
     #[test]
@@ -438,8 +493,51 @@ mod tests {
             updates: Tensor<2, Int>,
         ) -> Tensor<2, Int> {
             let output = {
-                let gathered = data.clone().gather(0, indices.clone());
-                data.scatter(0, indices, updates - gathered, burn::tensor::IndexingUpdateOp::Add)
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let mut __se_strides = [1usize; 2];
+                    for __se_d in (0..2 - 1).rev() {
+                        __se_strides[__se_d] = __se_strides[__se_d + 1]
+                            * __se_idx_dims[__se_d + 1];
+                    }
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        2,
+                    );
+                    for __se_d in 0..2 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
+                            );
+                    }
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    __se_data
+                        .scatter_nd(
+                            __se_coordinates,
+                            updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Assign,
+                        )
+                }
             };
             output
         }
@@ -457,7 +555,7 @@ mod tests {
             .config(config)
             .build();
         let code = codegen_forward_default(&node);
-        assert_snapshot!(code, @r#"
+        assert_snapshot!(code, @r"
         pub fn forward(
             &self,
             data: Tensor<1, Bool>,
@@ -465,61 +563,59 @@ mod tests {
             updates: Tensor<1, Bool>,
         ) -> Tensor<1, Bool> {
             let output = {
-                let data_dims = data.dims();
-                let updates_dims = updates.dims();
-                let indices_data = indices.to_data().convert::<i64>();
-                let indices_values: alloc::vec::Vec<i64> = indices_data
-                    .into_vec::<i64>()
-                    .unwrap();
-                let r = data_dims.len();
-                let dim: usize = 0;
-                let mut data_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    data_strides[i] = data_strides[i + 1] * data_dims[i + 1];
-                }
-                let mut idx_strides = alloc::vec![1usize; r];
-                for i in (0..r.saturating_sub(1)).rev() {
-                    idx_strides[i] = idx_strides[i + 1] * updates_dims[i + 1];
-                }
-                let total_data: usize = data_dims.iter().product();
-                let total_updates: usize = updates_dims.iter().product();
-                let mut output_flat = data.reshape([total_data]);
-                let updates_flat = updates.reshape([total_updates]);
-                for flat_idx in 0..total_updates {
-                    let mut remaining = flat_idx;
-                    let mut target_offset = 0usize;
-                    for d in 0..r {
-                        let coord = remaining / idx_strides[d];
-                        remaining %= idx_strides[d];
-                        if d == dim {
-                            let dim_size = data_dims[d] as i64;
-                            let mut idx = indices_values[flat_idx];
-                            if idx < 0 {
-                                idx += dim_size;
-                            }
-                            assert!(
-                                idx >= 0 && idx < dim_size,
-                                "ScatterElements: index out of bounds"
+                let __se_data = data;
+                let __se_axis_size = __se_data.dims()[0] as i64;
+                let __se_indices = indices.cast(burn::tensor::DType::I64);
+                let __se_negative = __se_indices.clone().lower_elem(0i64);
+                let __se_corrected = __se_indices.clone() + __se_axis_size;
+                let __se_indices = __se_indices.mask_where(__se_negative, __se_corrected);
+                let __se_idx_dims = __se_indices.dims();
+                let __se_n: usize = __se_idx_dims.iter().product();
+                if __se_n == 0 {
+                    __se_data
+                } else {
+                    let __se_strides = [1usize; 1];
+                    let __se_flat = Tensor::<
+                        1,
+                        Int,
+                    >::arange(0..__se_n as i64, (&self.device, burn::tensor::DType::I64));
+                    let mut __se_columns: alloc::vec::Vec<Tensor<2, Int>> = alloc::vec::Vec::with_capacity(
+                        1,
+                    );
+                    for __se_d in 0..1 {
+                        __se_columns
+                            .push(
+                                if __se_d == 0 {
+                                    __se_indices.clone().reshape([__se_n, 1])
+                                } else {
+                                    __se_flat
+                                        .clone()
+                                        .div_scalar(__se_strides[__se_d] as i64)
+                                        .remainder_scalar(__se_idx_dims[__se_d] as i64)
+                                        .reshape([__se_n, 1])
+                                },
                             );
-                            target_offset += idx as usize * data_strides[d];
-                        } else {
-                            target_offset += coord * data_strides[d];
-                        }
                     }
-                    let update_val = updates_flat.clone().narrow(0, flat_idx, 1);
-                    output_flat = output_flat
-                        .slice_assign([target_offset..target_offset + 1], update_val);
+                    let __se_coordinates = Tensor::cat(__se_columns, 1);
+                    let __se_updates = updates.int().cast(burn::tensor::DType::I64);
+                    __se_data
+                        .int()
+                        .cast(burn::tensor::DType::I64)
+                        .scatter_nd(
+                            __se_coordinates,
+                            __se_updates.reshape([__se_n]),
+                            burn::tensor::IndexingUpdateOp::Assign,
+                        )
+                        .bool()
                 }
-                output_flat.reshape(data_dims)
             };
             output
         }
-        "#);
+        ");
     }
 
     #[test]
-    #[should_panic(expected = "reduction not supported for bool tensors")]
-    fn test_scatter_elements_bool_add_panics() {
+    fn test_scatter_elements_bool_add_emits_compile_error() {
         let config = ScatterElementsConfig::new(0, ScatterElementsReduction::Add);
         let node = ScatterElementsNodeBuilder::new("scatter1")
             .input_tensor("data", 1, DType::Bool(BoolStore::Native))
@@ -528,6 +624,22 @@ mod tests {
             .output_tensor("output", 1, DType::Bool(BoolStore::Native))
             .config(config)
             .build();
-        codegen_forward_default(&node);
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r#"
+        pub fn forward(
+            &self,
+            data: Tensor<1, Bool>,
+            indices: Tensor<1, Int>,
+            updates: Tensor<1, Bool>,
+        ) -> Tensor<1, Bool> {
+            let output = {
+                compile_error!(
+                    "ScatterElements node 'scatter1': Add reduction is not supported for bool tensors"
+                );
+                unreachable!()
+            };
+            output
+        }
+        "#);
     }
 }
