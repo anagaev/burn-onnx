@@ -6,7 +6,8 @@ include_models!(
     global_lp_pool_l3,
     global_lp_pool_rank_4_l1,
     global_lp_pool_rank_4_l2,
-    global_lp_pool_rank_4_l3
+    global_lp_pool_rank_4_l3,
+    global_lp_pool_opset1_fractional_p
 );
 
 #[cfg(test)]
@@ -134,6 +135,26 @@ mod tests {
         let expected = TensorData::from([
             [[1.5780534], [1.6406361], [0.77402496]],
             [[2.3101003], [1.6673921], [1.8223873]],
+        ]);
+
+        output
+            .to_data()
+            .assert_approx_eq::<f32>(&expected, Tolerance::default());
+    }
+
+    // Opset 1 declares `p` as FLOAT with no integrality constraint. Neither
+    // onnxruntime nor onnx.reference can execute GlobalLpPool(1), so these values come
+    // from the spec formula, sum(|x|^p)^(1/p), computed in NumPy.
+    #[test]
+    fn global_lp_pool_opset1_fractional_p() {
+        let device = Default::default();
+        let model: global_lp_pool_opset1_fractional_p::Model =
+            global_lp_pool_opset1_fractional_p::Model::default();
+
+        let output = model.forward(test_input_rank_3(&device));
+        let expected = TensorData::from([
+            [[1.6279165], [1.6881945], [0.84793204]],
+            [[2.4333966], [1.7827995], [1.9110897]],
         ]);
 
         output

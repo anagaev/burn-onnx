@@ -21,8 +21,9 @@ use onnx_ir_derive::NodeBuilder;
 
 #[derive(Debug, Clone, new)]
 pub struct GlobalLpPoolConfig {
-    /// Norm type p (defaults to 2)
-    pub p: i64,
+    /// Norm type p (defaults to 2). Held as a float because opset 1 declares `p` as
+    /// FLOAT and does not restrict it to whole numbers.
+    pub p: f64,
 }
 
 #[derive(Debug, Clone, NodeBuilder)]
@@ -132,22 +133,14 @@ impl NodeProcessor for GlobalLpPoolProcessor {
 }
 
 /// Parse `p`, which ONNX declares FLOAT in opset 1 and INT from opset 2 on, so both
-/// representations are accepted. Defaults to 2 per the ONNX spec.
-fn extract_p(node: &RawNode) -> Result<i64, ProcessError> {
+/// representations are accepted. Opset 1 permits a fractional `p`, and the Lp formula
+/// is defined for it, so it is kept as-is rather than rounded or rejected. Defaults to
+/// 2 per the ONNX spec.
+fn extract_p(node: &RawNode) -> Result<f64, ProcessError> {
     let p = match node.attrs.get("p") {
-        None => 2,
-        Some(AttributeValue::Int64(p)) => *p,
-        // Opset 1 stores `p` as a float. Only whole values map onto the integer
-        // exponent codegen emits, so reject the rest rather than truncating.
-        Some(AttributeValue::Float32(p)) => {
-            if !p.is_finite() || p.fract() != 0.0 {
-                return Err(ProcessError::InvalidAttribute {
-                    name: "p".to_string(),
-                    reason: format!("expected a whole number, got {p}"),
-                });
-            }
-            *p as i64
-        }
+        None => 2.0,
+        Some(AttributeValue::Int64(p)) => *p as f64,
+        Some(AttributeValue::Float32(p)) => *p as f64,
         Some(other) => {
             return Err(ProcessError::InvalidAttribute {
                 name: "p".to_string(),
@@ -156,10 +149,11 @@ fn extract_p(node: &RawNode) -> Result<i64, ProcessError> {
         }
     };
 
-    if p <= 0 {
+    // `is_finite` also rules out NaN, which no comparison against 0 would catch.
+    if !p.is_finite() || p <= 0.0 {
         return Err(ProcessError::InvalidAttribute {
             name: "p".to_string(),
-            reason: format!("p must be > 0, got {p}"),
+            reason: format!("p must be finite and > 0, got {p}"),
         });
     }
     Ok(p)
@@ -270,16 +264,15 @@ mod tests {
         let node = create_test_node(None, 4, None).build();
         let processor = GlobalLpPoolProcessor;
         let config = processor.extract_config(&node, 16).unwrap();
-        assert_eq!(config.p, 2)
+        assert_eq!(config.p, 2.0)
     }
 
     #[test]
     fn test_global_lp_pool_extract_config_p4() {
-        let p = 4;
-        let node = create_test_node(Some(p), 4, None).build();
+        let node = create_test_node(Some(4), 4, None).build();
         let processor = GlobalLpPoolProcessor;
         let config = processor.extract_config(&node, 16).unwrap();
-        assert_eq!(config.p, p)
+        assert_eq!(config.p, 4.0)
     }
 
     #[test]
@@ -315,17 +308,30 @@ mod tests {
     fn test_global_lp_pool_opset1_float_p() {
         let node = create_test_node(None, 3, None).attr_float("p", 3.0).build();
         let processor = GlobalLpPoolProcessor;
-        assert_eq!(processor.extract_config(&node, 1).unwrap().p, 3);
+        assert_eq!(processor.extract_config(&node, 1).unwrap().p, 3.0);
+    }
+
+    /// Opset 1 puts no integrality constraint on `p`, and `sum(|x|^p)^(1/p)` is
+    /// defined for a fractional exponent, so it is carried through rather than
+    /// rounded or rejected.
+    #[test]
+    fn test_global_lp_pool_opset1_fractional_p() {
+        let node = create_test_node(None, 3, None).attr_float("p", 2.5).build();
+        let processor = GlobalLpPoolProcessor;
+        assert_eq!(processor.extract_config(&node, 1).unwrap().p, 2.5);
     }
 
     #[test]
-    fn test_global_lp_pool_opset1_fractional_p_rejected() {
-        let node = create_test_node(None, 3, None).attr_float("p", 2.5).build();
-        let processor = GlobalLpPoolProcessor;
-        assert!(matches!(
-            processor.extract_config(&node, 1),
-            Err(ProcessError::InvalidAttribute { ref name, .. }) if name == "p"
-        ));
+    fn test_global_lp_pool_rejects_non_finite_p() {
+        for bad in [f32::NAN, f32::INFINITY] {
+            let node = create_test_node(None, 3, None).attr_float("p", bad).build();
+            let processor = GlobalLpPoolProcessor;
+            let result = processor.extract_config(&node, 1);
+            assert!(
+                matches!(result, Err(ProcessError::InvalidAttribute { ref name, .. }) if name == "p"),
+                "p = {bad} should be rejected, got {result:?}"
+            );
+        }
     }
 
     /// bfloat16 joins T at opset 22 and must stay rejected before it.

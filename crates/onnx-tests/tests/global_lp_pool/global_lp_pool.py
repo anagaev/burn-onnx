@@ -16,7 +16,7 @@ from onnx import TensorProto
 import onnxruntime as ort
 
 
-def build_model(p, suffix, input_shape=(2, 3, 4)):
+def build_model(p, suffix, input_shape=(2, 3, 4), opset=7):
     np.random.seed(42)
 
     attrs = {}
@@ -43,9 +43,10 @@ def build_model(p, suffix, input_shape=(2, 3, 4)):
     graph = helper.make_graph(
         [node], "global_lp_pooling_graph", [input_info], [output_info]
     )
-    # Opset 7 keeps `p` as an INT attribute. Parsing across every opset the operator
-    # exists in is covered by the opset-compliance harness instead.
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 7)])
+    # Opset 7 keeps `p` as an INT attribute; opset 1 declares it FLOAT, which is the
+    # only encoding that can carry a fractional p. Parsing across every opset the
+    # operator exists in is covered by the opset-compliance harness instead.
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
     model.ir_version = 8
 
     onnx.checker.check_model(model)
@@ -55,10 +56,19 @@ def build_model(p, suffix, input_shape=(2, 3, 4)):
     print(f"Finished exporting model to {file_name}")
 
     test_input = np.random.randn(*input_shape).astype(np.float32)
-    # onnx.reference.ReferenceEvaluator has no GlobalLpPool implementation
-    # (RuntimeImplementationError), so onnxruntime is the only option here.
-    session = ort.InferenceSession(file_name, providers=["CPUExecutionProvider"])
-    output = session.run(None, {"input": test_input})[0]
+    # onnx.reference.ReferenceEvaluator has no GlobalLpPool implementation at all
+    # (RuntimeImplementationError), and onnxruntime has no GlobalLpPool(1) kernel
+    # (NOT_IMPLEMENTED), so opset 1 falls back to the formula from the spec.
+    if opset >= 2:
+        session = ort.InferenceSession(file_name, providers=["CPUExecutionProvider"])
+        output = session.run(None, {"input": test_input})[0]
+    else:
+        norm = 2.0 if p is None else float(p)
+        axes = tuple(range(2, len(input_shape)))
+        output = (
+            (np.abs(test_input.astype(np.float64)) ** norm).sum(axis=axes, keepdims=True)
+            ** (1.0 / norm)
+        ).astype(np.float32)
 
     print(f"Test input shape: {test_input.shape}")
     print("Test input:")
@@ -76,3 +86,5 @@ if __name__ == "__main__":
     build_model(p=1, suffix="rank_4_l1", input_shape=(2, 3, 2, 3))
     build_model(p=2, suffix="rank_4_l2", input_shape=(2, 3, 2, 3))
     build_model(p=3, suffix="rank_4_l3", input_shape=(2, 3, 2, 3))
+    # Opset 1 declares `p` as FLOAT and puts no integrality constraint on it.
+    build_model(p=2.5, suffix="opset1_fractional_p", opset=1)

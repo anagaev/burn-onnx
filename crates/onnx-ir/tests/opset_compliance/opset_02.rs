@@ -22,7 +22,7 @@ fn global_lp_pool(graph: &OnnxGraph) {
         globallppool1_out1: F32[1, 3, 1, 1]
       Config:
         GlobalLpPoolConfig {
-            p: 2,
+            p: 2.0,
         }
     "#);
 }
